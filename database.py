@@ -22,7 +22,6 @@ class Database:
         self._conn = await aiosqlite.connect(DATABASE_PATH)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.executescript(SCHEMA); await self._conn.commit()
-        # Add referred_by column if it doesn't exist (for older DBs)
         try: await self._conn.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER")
         except: pass
         await self._conn.commit()
@@ -72,6 +71,10 @@ class Database:
         
     async def get_today_free_count(self):
         td = datetime.now().strftime("%Y-%m-%d"); c = await self._conn.execute("SELECT COUNT(*) as c FROM trades WHERE DATE(created_at)=? AND channel_type='FREE'", (td,)); r = await c.fetchone(); return r["c"] if r else 0
+        
+    # NEW: VIP Count Function added
+    async def get_today_vip_count(self):
+        td = datetime.now().strftime("%Y-%m-%d"); c = await self._conn.execute("SELECT COUNT(*) as c FROM trades WHERE DATE(created_at)=? AND channel_type='VIP'", (td,)); r = await c.fetchone(); return r["c"] if r else 0
         
     async def update_stats(self, dt, **kw):
         c = await self._conn.execute("SELECT id FROM bot_stats WHERE stat_date=?", (dt,))
