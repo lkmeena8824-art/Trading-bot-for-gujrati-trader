@@ -13,9 +13,10 @@ PAYMENT_DETAILS_TEXT = os.getenv("PAYMENT_DETAILS_TEXT", "Payment ke liye UPI pa
 PAYMENT_TELEGRAM_LINK = os.getenv("PAYMENT_TELEGRAM_LINK", "https://t.me/YourID")
 PAYMENT_WHATSAPP_LINK = os.getenv("PAYMENT_WHATSAPP_LINK", "https://wa.me/919876543210?text=Hi%20Bhai%20Payment%20Kar%20Diya")
 
-MAX_DAILY_TRADES = 4
-ACTIVE_WINDOWS = [(9, 15, 11, 0), (13, 15, 15, 30)]
-NO_TRADE_WINDOWS = [(11, 0, 13, 15)]
+MAX_DAILY_TRADES = 5
+# Updated Trading Windows as per your request
+ACTIVE_WINDOWS = [(9, 15, 11, 30), (13, 15, 15, 45)]
+NO_TRADE_WINDOWS = [(11, 30, 13, 15)]
 OI_UPDATE_INTERVAL_MINUTES = 20
 
 PLANS = {
@@ -26,7 +27,6 @@ PLANS = {
 }
 RISK_DISCLAIMER = "⚠️ Risk Disclaimer: Stock trading involves market risks. We are analysis educators; manage capital responsibly."
 
-# Indian Market Holidays 2024-2025
 HOLIDAYS = [
     "2024-01-26", "2024-03-25", "2024-03-29", "2024-04-11", "2024-04-17", 
     "2024-05-01", "2024-06-17", "2024-07-17", "2024-08-15", "2024-10-02",
