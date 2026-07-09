@@ -13,8 +13,11 @@ PAYMENT_DETAILS_TEXT = os.getenv("PAYMENT_DETAILS_TEXT", "Payment ke liye UPI pa
 PAYMENT_TELEGRAM_LINK = os.getenv("PAYMENT_TELEGRAM_LINK", "https://t.me/YourID")
 PAYMENT_WHATSAPP_LINK = os.getenv("PAYMENT_WHATSAPP_LINK", "https://wa.me/919876543210?text=Hi%20Bhai%20Payment%20Kar%20Diya")
 
-MAX_DAILY_TRADES = 5
-# Updated Trading Windows as per your request
+# ⚠️ STRICT OVERTRADING PROTECTION LIMITS
+MAX_DAILY_FREE_TRADES = 3   # Max 3 calls in Free channel (Trust building)
+MAX_DAILY_VIP_TRADES = 1    # Strictly 1 Premium call in VIP channel
+MAX_DAILY_TRADES = MAX_DAILY_FREE_TRADES + MAX_DAILY_VIP_TRADES # Total 4
+
 ACTIVE_WINDOWS = [(9, 15, 11, 30), (13, 15, 15, 45)]
 NO_TRADE_WINDOWS = [(11, 30, 13, 15)]
 OI_UPDATE_INTERVAL_MINUTES = 20
