@@ -1,5 +1,4 @@
 import os, logging, sys, asyncio
-from handlers.subscription import register_subscription_handlers
 from telegram import Update
 from telegram.ext import ApplicationBuilder
 from config import validate_config, BOT_TOKEN
@@ -37,7 +36,6 @@ def main():
     if not validate_config(): sys.exit(1)
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).concurrent_updates(True).build()
     register_admin_handlers(app)
-        register_subscription_handlers(app)
     register_subscription_handlers(app)
     register_join_request_handler(app)
     register_spam_guard(app)
