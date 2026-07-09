@@ -7,7 +7,7 @@ from config import DATABASE_PATH, PLANS
 logger = logging.getLogger(__name__)
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS users (telegram_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, is_banned INTEGER DEFAULT 0, last_active TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS users (telegram_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, is_banned INTEGER DEFAULT 0, referred_by INTEGER, last_active TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS subscriptions (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, plan_name TEXT NOT NULL, start_date TEXT NOT NULL, end_date TEXT NOT NULL, is_active INTEGER DEFAULT 1, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, direction TEXT NOT NULL, entry_price REAL NOT NULL, sl REAL NOT NULL, target1 REAL, target2 REAL, target3 REAL, current_sl REAL, status TEXT DEFAULT 'ACTIVE', strategy TEXT NOT NULL, channel_type TEXT NOT NULL, message_id INTEGER, points_gained REAL DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS spam_blacklist (telegram_id INTEGER PRIMARY KEY, reason TEXT);
@@ -18,18 +18,21 @@ class Database:
     def __init__(self): self._conn = None
     
     async def connect(self):
-        # FIX: os import top me ho gaya hai isliye yahan error nahi aayega
         os.makedirs(os.path.dirname(DATABASE_PATH) or ".", exist_ok=True)
         self._conn = await aiosqlite.connect(DATABASE_PATH)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.executescript(SCHEMA); await self._conn.commit()
+        # Add referred_by column if it doesn't exist (for older DBs)
+        try: await self._conn.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER")
+        except: pass
+        await self._conn.commit()
         logger.info("DB connected.")
         
     async def close(self):
         if self._conn: await self._conn.close()
         
-    async def upsert_user(self, tid, username=None, fn=None):
-        await self._conn.execute("INSERT INTO users VALUES (?,?,?,0,CURRENT_TIMESTAMP) ON CONFLICT(telegram_id) DO UPDATE SET username=COALESCE(?,username), first_name=COALESCE(?,first_name), last_active=CURRENT_TIMESTAMP", (tid, username, fn, username, fn)); await self._conn.commit()
+    async def upsert_user(self, tid, username=None, fn=None, ref_by=None):
+        await self._conn.execute("INSERT INTO users VALUES (?,?,?,0,?,CURRENT_TIMESTAMP) ON CONFLICT(telegram_id) DO UPDATE SET username=COALESCE(?,username), first_name=COALESCE(?,first_name), referred_by=COALESCE(?,referred_by), last_active=CURRENT_TIMESTAMP", (tid, username, fn, ref_by, username, fn, ref_by)); await self._conn.commit()
         
     async def ban_user(self, tid, reason="Spam"):
         await self._conn.execute("INSERT OR REPLACE INTO spam_blacklist VALUES (?,?)", (tid, reason)); await self._conn.commit()
