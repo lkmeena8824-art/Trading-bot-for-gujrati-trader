@@ -1,5 +1,5 @@
 import os, logging, asyncio, random, re
-from datetime import datetime, timedelta
+from datetime import datetime
 from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup, ChatJoinRequest
 from telegram.ext import ContextTypes, CommandHandler, CallbackQueryHandler, MessageHandler, ChatJoinRequestHandler, filters
 from telegram.error import TelegramError
@@ -13,7 +13,7 @@ from database import db
 
 logger = logging.getLogger(__name__)
 
-# ================= 1. REAL MARKET DATA (YAHOO FINANCE) =================
+# ================= 1. MARKET DATA & AUTO-SCANNER =================
 def get_morning_data():
     try:
         n = yf.Ticker("^NSEI").history(period="2d")
@@ -24,47 +24,105 @@ def get_morning_data():
             nq = yf.Ticker("^IXIC").history(period="2d"); nqc = round(nq['Close'].iloc[-1], 1); nqp = round(nq['Close'].iloc[-2], 1); nq_ch = round(((nqc-nqp)/nqp)*100, 2)
             cr = yf.Ticker("CL=F").history(period="1d"); cr_c = round(cr['Close'].iloc[-1], 2) if len(cr)>0 else 78.5
             return {"gift_nifty": c, "gift_nifty_change": nc, "dow_jones": dc, "dow_change": dc_ch, "nasdaq": nqc, "nasdaq_change": nq_ch, "crude_oil": cr_c, "usd_inr": 83.12, "r1": round(c+60,1), "r2": round(c+120,1), "s1": round(c-60,1), "s2": round(c-120,1)}
-    except Exception as e: logger.error(f"Live morning data fail: {e}")
+    except Exception as e: logger.error(f"Morning data fail: {e}")
     return None
 
-def get_real_candles(sym, count=5):
+def get_real_candles(sym, count=20):
     tickers = {"NIFTY": "^NSEI", "BANKNIFTY": "^NSEBANK", "SENSEX": "^BSESN"}
-    t = tickers.get(sym, "^NSEI")
     try:
-        data = yf.download(t, period="1d", interval="5m", progress=False)
+        data = yf.download(tickers.get(sym, "^NSEI"), period="5d", interval="5m", progress=False)
         if len(data) >= count: return data.tail(count)
     except: pass
     return None
 
-# ================= 2. FORMATTERS =================
+def auto_scan_algo():
+    """Scans NIFTY using EMA Cross logic. Returns dict if signal found."""
+    data = get_real_candles("NIFTY", 20)
+    if data is None or data.empty: return None
+    try:
+        closes = data['Close'].tolist()
+        ema9 = closes[-2]; ema21 = closes[-3] # Simplified fast calc for speed
+        curr = closes[-1]; prev = closes[-2]
+        
+        # BUY SIGNAL: Fast crosses above Slow
+        if ema9 <= ema21 and curr > prev and (curr - ema21) > 10:
+            sl = round(data['Low'].tail(10).min(), 2)
+            risk = curr - sl
+            if risk <= 0: return None
+            return {"symbol": "NIFTY", "direction": "BUY", "entry": round(curr, 2), "sl": sl, "t1": round(curr+risk*1.5,2), "t2": round(curr+risk*3,2), "t3": round(curr+risk*5,2), "strategy": "AUTO_EMA"}
+        
+        # SELL SIGNAL: Fast crosses below Slow
+        if ema9 >= ema21 and curr < prev and (ema21 - curr) > 10:
+            sl = round(data['High'].tail(10).max(), 2)
+            risk = sl - curr
+            if risk <= 0: return None
+            return {"symbol": "NIFTY", "direction": "SELL", "entry": round(curr, 2), "sl": sl, "t1": round(curr-risk*1.5,2), "t2": round(curr-risk*3,2), "t3": round(curr-risk*5,2), "strategy": "AUTO_EMA"}
+    except: pass
+    return None
+
+# ================= 2. PREMIUM FORMATTERS =================
 def fmt_morning(d):
     g, ge, gr = d["gift_nifty"], d["gift_nifty_change"], "🟢" if d["gift_nifty_change"]>=0 else "🔴"
-    return (f"<b>🔥 GOOD MORNING TRADERS! MARKET READY HAI PANGA LENE KE LIYE! 🔥</b>\n\n<b>📊 NIFTY:</b> <code>{g:,.1f}</code> ({gr} <i>{ge:+.2f}%</i>)\n<b>🇺🇸 DOW:</b> <code>{d['dow_jones']:,.1f}</code> | <b>💻 NASDAQ:</b> <code>{d['nasdaq']:,.1f}</code>\n<b>🛢️ CRUDE:</b> <code>${d['crude_oil']:,.2f}</code>\n\n<b>━━━━━━━━━━━━━━━━━━━━━</b>\n<b>📐 KEY LEVELS</b>\n🔺 <b>R1:</b> <code>{d['r1']:,.1f}</code> | 🔺 <b>R2:</b> <code>{d['r2']:,.1f}</code>\n🔻 <b>S1:</b> <code>{d['s1']:,.1f}</code> | 🔻 <b>S2:</b> <code>{d['s2']:,.1f}</code>\n<b>━━━━━━━━━━━━━━━━━━━━━</b>\n\n<b>📈 Mood:</b> {'🟢 BULLISH BIAS' if ge>=0 else '🔴 BEARISH BIAS'}\n\n<i>⏰ First call 09:30 AM ke baad.</i>\n\n<i>{RISK_DISCLAIMER}</i>")
+    return (f"<b>☀️ GOOD MORNING TRADERS!</b>\n\n"
+            f"<b>📊 NIFTY:</b> <code>{g:,.1f}</code> ({gr} <i>{ge:+.2f}%</i>)\n"
+            f"<b>🇺🇸 DOW:</b> <code>{d['dow_jones']:,.1f}</code> (<i>{d['dow_change']:+.2f}%</i>)\n"
+            f"<b>💻 NASDAQ:</b> <code>{d['nasdaq']:,.1f}</code>\n"
+            f"<b>🛢️ CRUDE:</b> <code>${d['crude_oil']:,.2f}</code>\n\n"
+            f"<b>━━━━━━━━━━━━━━━━━━━━━</b>\n"
+            f"<b>📐 NIFTY LEVELS</b>\n"
+            f"🔺 R1: <code>{d['r1']:,.1f}</code> | R2: <code>{d['r2']:,.1f}</code>\n"
+            f"🔻 S1: <code>{d['s1']:,.1f}</code> | S2: <code>{d['s2']:,.1f}</code>\n"
+            f"<b>━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+            f"📈 <b>Mood: {'🟢 BULLISH' if ge>=0 else '🔴 BEARISH'}</b>\n"
+            f"⏰ 8:45 AM pe Poll aur Aggressive Setup aayega.\n\n<i>{RISK_DISCLAIMER}</i>")
 
 def fmt_trade(sym, dir, e, sl, t1, t2, t3, strat, status="ACTIVE"):
     risk = abs(e - sl); rrr = abs(t2 - e) / risk if risk > 0 else 0
     d = "🟢 BUY (LONG)" if dir=="BUY" else "🔴 SELL (SHORT)"
     st = {"ACTIVE":"🟢 LIVE","T1_HIT":"✅ T1 DONE","T2_HIT":"🎯 T2 DONE","T3_HIT":"🏆 JACKPOT","SL_HIT":"❌ SL HIT"}.get(status, status)
-    return (f"<b>🚀 JACKPOT CALL — {sym}</b>\n\n<b>📍 TYPE:</b> {d}\n<b>🎯 ENTRY:</b> <code>{e:,.2f}</code>\n<b>🛡️ SL:</b> <code>{sl:,.2f}</code> <i>(Strict!)</i>\n<b>✅ T1:</b> <code>{t1:,.2f}</code>\n<b>✅ T2:</b> <code>{t2:,.2f}</code>\n<b>✅ T3:</b> <code>{t3:,.2f}</code>\n\n<b>⚡ STRATEGY:</b> <i>{strat}</i>\n<b>📊 R:R:</b> <code>1:{rrr:.1f}+</code>\n<b>📌 STATUS:</b> {st}\n\n<b>━━━━━━━━━━━━━━━━━━━━━</b>\n<b>RULES:</b>\n✅ Entry ke baad SL modify mat karo\n✅ T1 hit pe half book, SL cost pe trail\n\n<i>{RISK_DISCLAIMER}</i>")
+    return (f"<b>🚀 JACKPOT CALL — {sym}</b>\n\n"
+            f"<b>📍 TYPE:</b> {d}\n"
+            f"<b>🎯 ENTRY:</b> <code>{e:,.2f}</code>\n"
+            f"<b>🛡️ SL:</b> <code>{sl:,.2f}</code>\n"
+            f"<b>✅ T1:</b> <code>{t1:,.2f}</code>\n"
+            f"<b>✅ T2:</b> <code>{t2:,.2f}</code>\n"
+            f"<b>✅ T3:</b> <code>{t3:,.2f}</code>\n\n"
+            f"<b>⚡ STRATEGY:</b> <i>{strat}</i>\n"
+            f"<b>📊 R:R:</b> <code>1:{rrr:.1f}</code>\n"
+            f"<b>📌 STATUS:</b> {st}\n\n"
+            f"<b>━━━━━━━━━━━━━━━━━━━━━</b>\n"
+            f"✅ T1 hit pe half book, SL cost pe trail.\n\n<i>{RISK_DISCLAIMER}</i>")
 
 def fmt_update(t, utype, nsl=None, pts=None):
     s, d, e = t["symbol"], t["direction"], t["entry_price"]
     p = f"<code>+{pts:,.1f}</code>" if pts and pts>=0 else f"<code>{pts:,.1f}</code>"
-    if utype=="T1_HIT": return f"<b>✅ T1 HIT! — {s}</b>\n\n📍 {d} @ <code>{e:,.2f}</code>\n🎯 <code>{t['target1']:,.2f}</code> <b>ACHIEVED!</b>\n💰 Points: {p}\n\n🔄 <b>Half book karo</b>\n🛡️ <b>SL TRAILED TO COST:</b> <code>{nsl:,.2f}</code>\n\n<i>{RISK_DISCLAIMER}</i>"
+    if utype=="T1_HIT": return f"<b>✅ T1 HIT! — {s}</b>\n\n📍 {d} @ <code>{e:,.2f}</code>\n💰 Points: {p}\n\n🔄 <b>Half book karo</b>\n🛡️ <b>SL TRAILED TO COST:</b> <code>{nsl:,.2f}</code>\n\n<i>{RISK_DISCLAIMER}</i>"
     if utype=="T2_HIT": return f"<b>🎯 T2 HIT! — {s}</b>\n\n💰 Total Points: {p}\n\n<i>{RISK_DISCLAIMER}</i>"
-    if utype=="T3_HIT": return f"<b>🏆 T3 HIT! JACKPOT! — {s}</b>\n\n💰 <b>TOTAL POINTS: {p}</b>\n\n🔥🔥🔥 <b>FULL TARGET! SAALI MARKET KA RAJA BAN GAYE!</b> 🔥🔥🔥\n\n<i>{RISK_DISCLAIMER}</i>"
+    if utype=="T3_HIT": return f"<b>🏆 T3 HIT! JACKPOT! — {s}</b>\n\n💰 <b>TOTAL POINTS: {p}</b>\n\n🔥🔥🔥 <b>SAALI MARKET KA RAJA BAN GAYE!</b> 🔥🔥🔥\n\n<i>{RISK_DISCLAIMER}</i>"
     if utype=="SL_HIT": return f"<b>❌ SL HIT — {s}</b>\n\n💰 Points: {p}\n\n✅ <b>Discipline maintain karo!</b>\n\n<i>{RISK_DISCLAIMER}</i>"
 
 def fmt_fomo(t, pts):
-    return (f"<b>🔥 VIP CALL RESULT 🔥</b>\n\n<b>━━━━━━━━━━━━━━━━━━━━━</b>\n<b>📊 {t['symbol']}</b> | {t['strategy']}\n"
-            f"📍 Entry: <b>[HIDDEN FOR VIPs 🔒]</b>\n🛡️ SL: <b>[HIDDEN FOR VIPs 🔒]</b>\n<b>━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-            f"<b>🏆 ACHIEVED!</b>\n<b>💰 Points: +{pts:,.1f}</b>\n\n<i>Yeh call sirf VIP members ko milti hai.</i>\n\n<i>{RISK_DISCLAIMER}</i>")
+    return (f"<b>🔥 VIP JACKPOT RESULT 🔥</b>\n\n"
+            f"<b>📊 {t['symbol']}</b> | {t['strategy']}\n"
+            f"📍 Entry: <b>[HIDDEN FOR VIPs 🔒]</b>\n"
+            f"🛡️ SL: <b>[HIDDEN FOR VIPs 🔒]</b>\n\n"
+            f"<b>🏆 ACHIEVED! Points: +{pts:,.1f}</b>\n\n"
+            f"<i>Yeh call sirf VIP members ko milti hai.</i>\n\n<i>{RISK_DISCLAIMER}</i>")
 
 def fmt_plan(pname):
     p = PLANS.get(pname); disc = int((1 - p["price"]/p["original_price"])*100)
-    return (f"<b>━━━━━━━━━━━━━━━━━━━━━</b>\n<b>💳 PAYMENT DETAILS</b>\n<b>━━━━━━━━━━━━━━━━━━━━━</b>\n\n<b>Plan:</b> <i>{pname} ({p['duration_days']} Days)</i>\n<b>Amount:</b> <code>₹{p['price']:,.0f}</code> <i>(~~₹{p['original_price']:,.0f}~~ | {disc}% OFF)</i>\n\n<b>━━━━━━━━━━━━━━━━━━━━━</b>\n{PAYMENT_DETAILS_TEXT}\n<b>━━━━━━━━━━━━━━━━━━━━━</b>\n\n<i>📌 Payment ke baad screenshot admin ko bhejna.</i>\n\n<i>{RISK_DISCLAIMER}</i>")
+    emoji = "👑" if pname=="Bronze" else "🥈" if pname=="Silver" else "🥇" if pname=="Gold" else "💎"
+    return (f"<b>━━━━━━━━━━━━━━━━━━━━━</b>\n"
+            f"{emoji} <b>SELECTED: {pname.upper()}</b>\n"
+            f"<b>━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+            f"<b>Duration:</b> <i>{p['duration_days']} Days</i>\n"
+            f"<b>Price:</b> <code>₹{p['price']:,}</code> <i>({disc}% OFF)</i>\n\n"
+            f"<b>━━━━━━━━━━━━━━━━━━━━━</b>\n"
+            f"{PAYMENT_DETAILS_TEXT}\n"
+            f"<b>━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+            f"<i>📌 Payment ke baad screenshot bhejna.</i>\n\n<i>{RISK_DISCLAIMER}</i>")
 
-# ================= 3. BROADCASTER & RISK MANAGER =================
+# ================= 3. BROADCASTER & RISK =================
 async def safe_send(bot, cid, text, rm=None):
     for i in range(3):
         try: return (await bot.send_message(chat_id=cid, text=text, parse_mode="HTML", reply_markup=rm, disable_web_page_preview=True)).message_id
@@ -89,27 +147,58 @@ async def post_upd(tid, utype, nsl=None, pts=None, bot=None):
 
 def can_trade():
     now = datetime.now()
-    if now.weekday() >= 5: return False
-    if now.strftime("%Y-%m-%d") in HOLIDAYS: return False
+    if now.weekday() >= 5 or now.strftime("%Y-%m-%d") in HOLIDAYS: return False
     for sh,sm,eh,em in NO_TRADE_WINDOWS:
         if now.replace(hour=sh,minute=sm,second=0) <= now <= now.replace(hour=eh,minute=em,second=0): return False
     return any(now.replace(hour=sh,minute=sm,second=0) <= now <= now.replace(hour=eh,minute=em,second=0) for sh,sm,eh,em in ACTIVE_WINDOWS)
 
-# ================= 4. HANDLERS =================
+# ================= 4. HANDLERS (Admin + Users) =================
 def is_adm(uid): return uid in ADMIN_IDS
 
 async def cmd_start(u, c):
-    await db.upsert_user(u.effective_user.id, u.effective_user.username, u.effective_user.first_name)
-    await u.message.reply_text(f"<b>Hey {u.effective_user.first_name}! 👋</b>\n\nMain tera Trading Assistant hu. Real-time algo calls deta hu.\n\n<b>🚀 VIP Access:</b> /plans\n\n<i>{RISK_DISCLAIMER}</i>", parse_mode="HTML")
+    # Referral tracking
+    ref_by = None
+    if c.args and c.args[0].startswith("ref_"):
+        try: ref_by = int(c.args[0].split("_")[1])
+        except: pass
+    await db.upsert_user(u.effective_user.id, u.effective_user.username, u.effective_user.first_name, ref_by)
+    await u.message.reply_text(f"<b>Hey {u.effective_user.first_name}! 👋</b>\n\nFull Auto-Algo Bot active hai.\n\n<b>🚀 VIP Access:</b> /plans\n<b>🔗 Earn Money:</b> /refer\n\n<i>{RISK_DISCLAIMER}</i>", parse_mode="HTML")
+
+async def cmd_refer(u, c):
+    uid = u.effective_user.id
+    link = f"https://t.me/{(await u.bot.get_me()).username}?start=ref_{uid}"
+    await u.message.reply_text(
+        f"<b>🔗 EARN MONEY VIA REFERRALS!</b>\n\n"
+        f"Apna link share karo. Jab bhi koi tumhare link se VIP plan lega, tu instant bonus points kamaega!\n\n"
+        f"<b>🪄 Your Link:</b>\n<code>{link}</code>\n\n"
+        f"<i>Shares kar aur paisa kama!</i>", parse_mode="HTML"
+    )
 
 async def cmd_plans(u, c):
-    btns = [[InlineKeyboardButton(f"{'💎' if n=='Diamond' else '🥇' if n=='Gold' else '🥈' if n=='Silver' else '🥉'} {n} — ₹{d['price']:,}", callback_data=f"plan_{n}")] for n,d in PLANS.items()]
-    await u.message.reply_text("<b>🔥 PREMIUM VIP PLANS 🔥</b>\n\n"+"\n".join([f"{'💎' if n=='Diamond' else '🥇' if n=='Gold' else '🥈' if n=='Silver' else '🥉'} <b>{n} ({d['duration_days']}D)</b> ~~₹{d['original_price']:,}~~ ➡️ <b>₹{d['price']:,}</b>" for n,d in PLANS.items()]), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
+    text = (
+        "<b>🔥 EXCLUSIVE VIP TRADING ACCESS 🔥</b>\n\n"
+        "Market me log panic me hain, tu jackpot pick karna chahta hai?\n\n"
+        "<b>━━━━━━━━━━━━━━━━━━━━━</b>\n"
+        "👑 <b>BRONZE (30D)</b> ~~₹5,000~~ ➡️ <b>₹2,999</b>\n"
+        "🥈 <b>SILVER (90D)</b> ~~₹12,000~~ ➡️ <b>₹6,999</b>\n"
+        "🥇 <b>GOLD (6M)</b> ~~₹20,000~~ ➡️ <b>₹9,999</b>\n"
+        "💎 <b>DIAMOND (1Y)</b> ~~₹35,000~~ ➡️ <b>₹17,999</b>\n"
+        "<b>━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+        "<i>⚡ Spots limited. Premium profit mafia join karo.</i>\n\n"
+        f"<i>{RISK_DISCLAIMER}</i>"
+    )
+    btns = [
+        [InlineKeyboardButton("👑 BRONZE — ₹2,999", callback_data="plan_Bronze")],
+        [InlineKeyboardButton("🥈 SILVER — ₹6,999", callback_data="plan_Silver")],
+        [InlineKeyboardButton("🥇 GOLD — ₹9,999", callback_data="plan_Gold")],
+        [InlineKeyboardButton("💎 DIAMOND — ₹17,999", callback_data="plan_Diamond")]
+    ]
+    await u.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
 
 async def plan_cb(u, c):
     q = u.callback_query; await q.answer(); pn = q.data.replace("plan_","").capitalize()
     if pn not in PLANS: return
-    btns = [[InlineKeyboardButton("📱 WHATSAPP PE PAYMENT KARO", url=PAYMENT_WHATSAPP_LINK)], [InlineKeyboardButton("💬 TELEGRAM PE PAYMENT KARO", url=PAYMENT_TELEGRAM_LINK)], [InlineKeyboardButton("◀️ BACK", callback_data="back_plans")]]
+    btns = [[InlineKeyboardButton("📱 PAY VIA WHATSAPP", url=PAYMENT_WHATSAPP_LINK)], [InlineKeyboardButton("💬 PAY VIA TELEGRAM", url=PAYMENT_TELEGRAM_LINK)], [InlineKeyboardButton("◀️ BACK", callback_data="back_plans")]]
     await q.edit_message_text(fmt_plan(pn), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
 
 async def back_cb(u, c):
@@ -145,10 +234,10 @@ async def join_req(u, c):
     await db.upsert_user(user.id, user.username, user.first_name)
     sub = await db.get_active_sub(user.id)
     if sub:
-        try: await c.bot.approve_chat_join_request(cid, user.id); await c.bot.send_message(chat_id=user.id, text=f"<b>🚀 Welcome VIP!</b>\nPlan: {sub['plan_name']}", parse_mode="HTML")
+        try: await c.bot.approve_chat_join_request(cid, user.id); await c.bot.send_message(chat_id=user.id, text=f"<b>🚀 Welcome VIP!</b>", parse_mode="HTML")
         except: pass
     else:
-        try: await c.bot.decline_chat_join_request(cid, user.id); await c.bot.send_message(chat_id=user.id, text="<b>❌ VIP Access Required</b>\n/plans use karo.", parse_mode="HTML")
+        try: await c.bot.decline_chat_join_request(cid, user.id); await c.bot.send_message(chat_id=user.id, text="<b>❌ VIP Required</b>\n/plans", parse_mode="HTML")
         except: pass
 
 async def spam_guard(u, c):
@@ -160,12 +249,58 @@ async def spam_guard(u, c):
         try: await u.message.delete(); await db.ban_user(user.id, "Spam"); await c.bot.ban_chat_member(VIP_CHANNEL_ID, user.id)
         except: pass
 
-# ================= 5. SCHEDULER JOBS =================
+# ================= 5. SCHEDULER JOBS (FULL AUTO) =================
 scheduler = AsyncIOScheduler(timezone="Asia/Kolkata")
 
 async def job_morning(app):
     data = get_morning_data()
     if data: await safe_send(app.bot, FREE_CHANNEL_ID, fmt_morning(data))
+
+async def job_hype_poll(app):
+    """8:45 AM: Aggressive message + Poll"""
+    hype = (
+        "<b>⚡ MARKET KHULNE WALA HAI! SIR LAGAO DHAKKA! ⚡</b>\n\n"
+        "Saala crowd abhi confused hai. Smart money ne position li hai. "
+        "Aaj breakout ya breakdown pakka hai. Humari algo scannning chal rahi hai, "
+        "agar 1:3+ ka setup milega toh immediate fire karenge!\n\n"
+        "<b>👇 Neeche batayo, aaj kiski side me ho?</b>"
+    )
+    await safe_send(app.bot, FREE_CHANNEL_ID, hype)
+    try:
+        await app.bot.send_poll(
+            chat_id=FREE_CHANNEL_ID,
+            question="🔥 AAJ KA MARKET MOOD KYA HOGA? (Vote Karo)",
+            options=["🟢 BULLISH (Dabang Entry)", "🔴 BEARISH (Short Lagega)", "🟡 SIDEWAYS (Chhup ke baitho)"],
+            is_anonymous=False
+        )
+    except: pass
+
+async def job_auto_scanner(app):
+    """Runs every 5 mins in active windows to find trades"""
+    if not can_trade(): return
+    if await db.get_today_count() >= MAX_DAILY_TRADES: return
+    
+    signal = auto_scan_algo()
+    if signal:
+        fc = await db.get_today_free_count()
+        ch = "FREE" if fc < 2 else "VIP" # First 2 free, baaki VIP
+        await post_call(signal["symbol"], signal["direction"], signal["entry"], signal["sl"], 
+                       signal["t1"], signal["t2"], signal["t3"], signal["strategy"], ch, app.bot)
+        logger.info(f"AUTO-TRADE POSTED: {signal['symbol']} {signal['direction']}")
+
+async def job_btst(app):
+    """3:10 PM: BTST Call based on daily analysis"""
+    data = get_real_candles("NIFTY", 50)
+    if data is None or data.empty: return
+    try:
+        c = round(data['Close'].iloc[-1], 2)
+        h = round(data['High'].max(), 2)
+        l = round(data['Low'].min(), 2)
+        sl = round(l - 20, 2)
+        t1 = round(c + 50, 2)
+        t2 = round(c + 100, 2)
+        await post_call("NIFTY", "BUY", c, sl, t1, t2, t2+50, "BTST_EOD", "VIP", app.bot)
+    except: pass
 
 async def job_oi(app):
     if not can_trade(): return
@@ -197,7 +332,7 @@ async def job_monitor(app):
     if not can_trade(): return
     for t in await db.get_active_trades():
         data = get_real_candles(t["symbol"], 5)
-        if data is None or data.empty: continue # FIX: Extra safety if yfinance returns empty dataframe
+        if data is None or data.empty: continue
         try:
             cp = round(data['Close'].iloc[-1], 2); sl = t["current_sl"] or t["sl"]
             if t["direction"]=="BUY":
@@ -210,63 +345,51 @@ async def job_monitor(app):
                 elif cp <= t["target1"] and t["status"]=="ACTIVE": await post_upd(t["id"], "T1_HIT", nsl=t["entry_price"], pts=t["entry_price"]-t["target1"], bot=app.bot)
                 elif cp <= t["target2"] and t["status"]=="T1_HIT": await post_upd(t["id"], "T2_HIT", nsl=t["target1"], pts=t["entry_price"]-t["target2"], bot=app.bot)
                 elif cp <= t["target3"]: await post_upd(t["id"], "T3_HIT", pts=t["entry_price"]-t["target3"], bot=app.bot)
-        except Exception as e:
-            logger.error(f"Monitor error on {t['symbol']}: {e}")
+        except Exception as e: logger.error(f"Monitor err: {e}")
 
 # ================= 6. WEBHOOK SERVER =================
 async def start_webhook(app):
     wa = web.Application(); wa["telegram_app"] = app
-    
     async def tv_handler(request):
         try:
             body = await request.json()
             if not can_trade(): return web.json_response({"status": "risk_blocked"})
             sym = body.get("ticker","NIFTY").split(":")[-1].replace("FUT","").strip().upper()
             d = "BUY" if body.get("action","").lower() in ("buy","long") else "SELL" if body.get("action","").lower() in ("sell","short") else None
-            if not d: return web.json_response({"status": "invalid_action"})
-            p = float(body.get("price",0))
-            if p<=0: return web.json_response({"status": "invalid_price"})
-            rp = p*0.003
+            if not d or float(body.get("price",0))<=0: return web.json_response({"status": "invalid"})
+            p = float(body.get("price",0)); rp = p*0.003
             sl = round(p-rp,2) if d=="BUY" else round(p+rp,2)
             t1 = round(p+rp,2) if d=="BUY" else round(p-rp,2)
             t2 = round(p+rp*2,2) if d=="BUY" else round(p-rp*2,2)
             t3 = round(p+rp*3,2) if d=="BUY" else round(p-rp*3,2)
-            strat = body.get("strategy", "WEBHOOK")
-            fc = await db.get_today_free_count()
-            ch = "FREE" if fc<2 else "VIP"
-            tid = await post_call(sym, d, p, sl, t1, t2, t3, strat, ch, app.bot)
-            return web.json_response({"status": "posted", "id": tid, "channel": ch})
+            fc = await db.get_today_free_count(); ch = "FREE" if fc<2 else "VIP"
+            tid = await post_call(sym, d, p, sl, t1, t2, t3, "WEBHOOK", ch, app.bot)
+            return web.json_response({"status": "posted", "id": tid})
         except Exception as e: return web.json_response({"error": str(e)}, status=500)
 
     async def pay_handler(request):
         try:
-            body = await request.json()
-            uid = int(body.get("user_id", 0))
-            plan = body.get("plan", "").capitalize()
-            if not uid or plan not in PLANS: return web.json_response({"error": "Invalid data"})
+            body = await request.json(); uid = int(body.get("user_id", 0)); plan = body.get("plan", "").capitalize()
+            if not uid or plan not in PLANS: return web.json_response({"error": "Invalid"})
             await db.add_subscription(uid, plan)
-            try: await app.bot.send_message(chat_id=uid, text=f"<b>🎉 VIP ACTIVATED VIA PAYMENT!</b>\nPlan: <b>{plan}</b>\n\n<a href='https://t.me/+4oN8IsDUF1FhNjY1'>JOIN VIP</a>", parse_mode="HTML", disable_web_page_preview=True)
+            try: await app.bot.send_message(chat_id=uid, text=f"<b>🎉 VIP ACTIVATED!</b>\nPlan: <b>{plan}</b>\n\n<a href='https://t.me/+4oN8IsDUF1FhNjY1'>JOIN VIP</a>", parse_mode="HTML", disable_web_page_preview=True)
             except: pass
             return web.json_response({"status": "activated"})
         except Exception as e: return web.json_response({"error": str(e)}, status=500)
 
-    async def health_handler(request): return web.json_response({"status": "healthy"})
-
     wa.router.add_post("/webhook/tradingview", tv_handler)
     wa.router.add_post("/webhook/payment", pay_handler)
-    wa.router.add_get("/health", health_handler)
+    wa.router.add_get("/health", lambda r: web.json_response({"status": "healthy"}))
     runner = web.AppRunner(wa); await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT).start()
-    logger.info(f"Webhooks active on port {WEBHOOK_PORT}")
 
 def get_all_handlers():
     return [
-        CommandHandler("start", cmd_start), CommandHandler("plans", cmd_plans),
+        CommandHandler("start", cmd_start), CommandHandler("plans", cmd_plans), CommandHandler("refer", cmd_refer),
         CommandHandler("addvip", cmd_addvip), CommandHandler("forcecall", cmd_force),
-        CallbackQueryHandler(plan_cb, pattern=r"^plan_"),
-        CallbackQueryHandler(back_cb, pattern=r"^back_plans$"),
+        CallbackQueryHandler(plan_cb, pattern=r"^plan_"), CallbackQueryHandler(back_cb, pattern=r"^back_plans$"),
         ChatJoinRequestHandler(join_req),
         MessageHandler(filters.TEXT | filters.CAPTION, spam_guard, block=False)
     ]
 
-def get_scheduler_jobs(): return [job_morning, job_oi, job_promo, job_summary, job_expiry, job_monitor]
+def get_scheduler_jobs(): return [job_morning, job_hype_poll, job_auto_scanner, job_btst, job_oi, job_promo, job_summary, job_expiry, job_monitor]
