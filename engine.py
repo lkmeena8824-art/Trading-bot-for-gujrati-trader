@@ -1,4 +1,4 @@
-import os, logging, asyncio, random, re
+import os, logging, asyncio, random, re, time
 from datetime import datetime
 from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup, ChatJoinRequest
 from telegram.ext import ContextTypes, CommandHandler, CallbackQueryHandler, MessageHandler, ChatJoinRequestHandler, filters
@@ -13,7 +13,10 @@ from database import db
 
 logger = logging.getLogger(__name__)
 
-# ================= 1. MARKET DATA & AUTO-SCANNER =================
+# Anti-spam cooldown for scanner (seconds)
+LAST_AUTO_POST_TIME = 0 
+
+# ================= 1. MARKET DATA & SCANNER =================
 def get_morning_data():
     try:
         n = yf.Ticker("^NSEI").history(period="2d")
@@ -36,22 +39,19 @@ def get_real_candles(sym, count=20):
     return None
 
 def auto_scan_algo():
-    """Scans NIFTY using EMA Cross logic. Returns dict if signal found."""
     data = get_real_candles("NIFTY", 20)
     if data is None or data.empty: return None
     try:
         closes = data['Close'].tolist()
-        ema9 = closes[-2]; ema21 = closes[-3] # Simplified fast calc for speed
+        ema9 = closes[-2]; ema21 = closes[-3] 
         curr = closes[-1]; prev = closes[-2]
         
-        # BUY SIGNAL: Fast crosses above Slow
         if ema9 <= ema21 and curr > prev and (curr - ema21) > 10:
             sl = round(data['Low'].tail(10).min(), 2)
             risk = curr - sl
             if risk <= 0: return None
             return {"symbol": "NIFTY", "direction": "BUY", "entry": round(curr, 2), "sl": sl, "t1": round(curr+risk*1.5,2), "t2": round(curr+risk*3,2), "t3": round(curr+risk*5,2), "strategy": "AUTO_EMA"}
         
-        # SELL SIGNAL: Fast crosses below Slow
         if ema9 >= ema21 and curr < prev and (ema21 - curr) > 10:
             sl = round(data['High'].tail(10).max(), 2)
             risk = sl - curr
@@ -60,7 +60,7 @@ def auto_scan_algo():
     except: pass
     return None
 
-# ================= 2. PREMIUM FORMATTERS =================
+# ================= 2. FORMATTERS =================
 def fmt_morning(d):
     g, ge, gr = d["gift_nifty"], d["gift_nifty_change"], "🟢" if d["gift_nifty_change"]>=0 else "🔴"
     return (f"<b>☀️ GOOD MORNING TRADERS!</b>\n\n"
@@ -74,24 +74,19 @@ def fmt_morning(d):
             f"🔻 S1: <code>{d['s1']:,.1f}</code> | S2: <code>{d['s2']:,.1f}</code>\n"
             f"<b>━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
             f"📈 <b>Mood: {'🟢 BULLISH' if ge>=0 else '🔴 BEARISH'}</b>\n"
-            f"⏰ 8:45 AM pe Poll aur Aggressive Setup aayega.\n\n<i>{RISK_DISCLAIMER}</i>")
+            f"⏰ 8:45 AM pe Poll aayega.\n\n<i>{RISK_DISCLAIMER}</i>")
 
 def fmt_trade(sym, dir, e, sl, t1, t2, t3, strat, status="ACTIVE"):
     risk = abs(e - sl); rrr = abs(t2 - e) / risk if risk > 0 else 0
     d = "🟢 BUY (LONG)" if dir=="BUY" else "🔴 SELL (SHORT)"
     st = {"ACTIVE":"🟢 LIVE","T1_HIT":"✅ T1 DONE","T2_HIT":"🎯 T2 DONE","T3_HIT":"🏆 JACKPOT","SL_HIT":"❌ SL HIT"}.get(status, status)
     return (f"<b>🚀 JACKPOT CALL — {sym}</b>\n\n"
-            f"<b>📍 TYPE:</b> {d}\n"
-            f"<b>🎯 ENTRY:</b> <code>{e:,.2f}</code>\n"
+            f"<b>📍 TYPE:</b> {d}\n<b>🎯 ENTRY:</b> <code>{e:,.2f}</code>\n"
             f"<b>🛡️ SL:</b> <code>{sl:,.2f}</code>\n"
-            f"<b>✅ T1:</b> <code>{t1:,.2f}</code>\n"
-            f"<b>✅ T2:</b> <code>{t2:,.2f}</code>\n"
-            f"<b>✅ T3:</b> <code>{t3:,.2f}</code>\n\n"
-            f"<b>⚡ STRATEGY:</b> <i>{strat}</i>\n"
-            f"<b>📊 R:R:</b> <code>1:{rrr:.1f}</code>\n"
-            f"<b>📌 STATUS:</b> {st}\n\n"
-            f"<b>━━━━━━━━━━━━━━━━━━━━━</b>\n"
-            f"✅ T1 hit pe half book, SL cost pe trail.\n\n<i>{RISK_DISCLAIMER}</i>")
+            f"<b>✅ T1:</b> <code>{t1:,.2f}</code> | <b>T2:</b> <code>{t2:,.2f}</code> | <b>T3:</b> <code>{t3:,.2f}</code>\n\n"
+            f"<b>⚡ STRATEGY:</b> <i>{strat}</i> | <b>📊 R:R:</b> <code>1:{rrr:.1f}</code>\n"
+            f"<b>📌 STATUS:</b> {st}\n\n<b>━━━━━━━━━━━━━━━━━━━━━</b>\n"
+            f"✅ T1 pe half book, SL cost pe trail.\n\n<i>{RISK_DISCLAIMER}</i>")
 
 def fmt_update(t, utype, nsl=None, pts=None):
     s, d, e = t["symbol"], t["direction"], t["entry_price"]
@@ -102,24 +97,16 @@ def fmt_update(t, utype, nsl=None, pts=None):
     if utype=="SL_HIT": return f"<b>❌ SL HIT — {s}</b>\n\n💰 Points: {p}\n\n✅ <b>Discipline maintain karo!</b>\n\n<i>{RISK_DISCLAIMER}</i>"
 
 def fmt_fomo(t, pts):
-    return (f"<b>🔥 VIP JACKPOT RESULT 🔥</b>\n\n"
-            f"<b>📊 {t['symbol']}</b> | {t['strategy']}\n"
-            f"📍 Entry: <b>[HIDDEN FOR VIPs 🔒]</b>\n"
-            f"🛡️ SL: <b>[HIDDEN FOR VIPs 🔒]</b>\n\n"
-            f"<b>🏆 ACHIEVED! Points: +{pts:,.1f}</b>\n\n"
-            f"<i>Yeh call sirf VIP members ko milti hai.</i>\n\n<i>{RISK_DISCLAIMER}</i>")
+    return (f"<b>🔥 VIP JACKPOT RESULT 🔥</b>\n\n<b>📊 {t['symbol']}</b> | {t['strategy']}\n"
+            f"📍 Entry: <b>[HIDDEN FOR VIPs 🔒]</b>\n🛡️ SL: <b>[HIDDEN FOR VIPs 🔒]</b>\n\n"
+            f"<b>🏆 ACHIEVED! Points: +{pts:,.1f}</b>\n\n<i>Yeh call sirf VIP members ko milti hai.</i>\n\n<i>{RISK_DISCLAIMER}</i>")
 
 def fmt_plan(pname):
     p = PLANS.get(pname); disc = int((1 - p["price"]/p["original_price"])*100)
     emoji = "👑" if pname=="Bronze" else "🥈" if pname=="Silver" else "🥇" if pname=="Gold" else "💎"
-    return (f"<b>━━━━━━━━━━━━━━━━━━━━━</b>\n"
-            f"{emoji} <b>SELECTED: {pname.upper()}</b>\n"
-            f"<b>━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-            f"<b>Duration:</b> <i>{p['duration_days']} Days</i>\n"
-            f"<b>Price:</b> <code>₹{p['price']:,}</code> <i>({disc}% OFF)</i>\n\n"
-            f"<b>━━━━━━━━━━━━━━━━━━━━━</b>\n"
-            f"{PAYMENT_DETAILS_TEXT}\n"
-            f"<b>━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+    return (f"<b>━━━━━━━━━━━━━━━━━━━━━</b>\n{emoji} <b>SELECTED: {pname.upper()}</b>\n<b>━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+            f"<b>Duration:</b> <i>{p['duration_days']} Days</b>\n<b>Price:</b> <code>₹{p['price']:,}</code> <i>({disc}% OFF)</i>\n\n"
+            f"<b>━━━━━━━━━━━━━━━━━━━━━</b>\n{PAYMENT_DETAILS_TEXT}\n<b>━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
             f"<i>📌 Payment ke baad screenshot bhejna.</i>\n\n<i>{RISK_DISCLAIMER}</i>")
 
 # ================= 3. BROADCASTER & RISK =================
@@ -152,47 +139,33 @@ def can_trade():
         if now.replace(hour=sh,minute=sm,second=0) <= now <= now.replace(hour=eh,minute=em,second=0): return False
     return any(now.replace(hour=sh,minute=sm,second=0) <= now <= now.replace(hour=eh,minute=em,second=0) for sh,sm,eh,em in ACTIVE_WINDOWS)
 
-# ================= 4. HANDLERS (Admin + Users) =================
+# ================= 4. HANDLERS =================
 def is_adm(uid): return uid in ADMIN_IDS
 
 async def cmd_start(u, c):
-    # Referral tracking
     ref_by = None
     if c.args and c.args[0].startswith("ref_"):
         try: ref_by = int(c.args[0].split("_")[1])
         except: pass
     await db.upsert_user(u.effective_user.id, u.effective_user.username, u.effective_user.first_name, ref_by)
-    await u.message.reply_text(f"<b>Hey {u.effective_user.first_name}! 👋</b>\n\nFull Auto-Algo Bot active hai.\n\n<b>🚀 VIP Access:</b> /plans\n<b>🔗 Earn Money:</b> /refer\n\n<i>{RISK_DISCLAIMER}</i>", parse_mode="HTML")
+    await u.message.reply_text(f"<b>Hey {u.effective_user.first_name}! 👋</b>\n\nStrictly Quality Calls. Auto Algo Active.\n\n<b>🚀 VIP:</b> /plans | <b>🔗 Earn:</b> /refer\n\n<i>{RISK_DISCLAIMER}</i>", parse_mode="HTML")
 
 async def cmd_refer(u, c):
     uid = u.effective_user.id
     link = f"https://t.me/{(await u.bot.get_me()).username}?start=ref_{uid}"
-    await u.message.reply_text(
-        f"<b>🔗 EARN MONEY VIA REFERRALS!</b>\n\n"
-        f"Apna link share karo. Jab bhi koi tumhare link se VIP plan lega, tu instant bonus points kamaega!\n\n"
-        f"<b>🪄 Your Link:</b>\n<code>{link}</code>\n\n"
-        f"<i>Shares kar aur paisa kama!</i>", parse_mode="HTML"
-    )
+    await u.message.reply_text(f"<b>🔗 EARN VIA REFERRALS!</b>\n\n<code>{link}</code>\n\n<i>Share kar aur kamao!</i>", parse_mode="HTML")
 
 async def cmd_plans(u, c):
-    text = (
-        "<b>🔥 EXCLUSIVE VIP TRADING ACCESS 🔥</b>\n\n"
-        "Market me log panic me hain, tu jackpot pick karna chahta hai?\n\n"
-        "<b>━━━━━━━━━━━━━━━━━━━━━</b>\n"
-        "👑 <b>BRONZE (30D)</b> ~~₹5,000~~ ➡️ <b>₹2,999</b>\n"
-        "🥈 <b>SILVER (90D)</b> ~~₹12,000~~ ➡️ <b>₹6,999</b>\n"
-        "🥇 <b>GOLD (6M)</b> ~~₹20,000~~ ➡️ <b>₹9,999</b>\n"
-        "💎 <b>DIAMOND (1Y)</b> ~~₹35,000~~ ➡️ <b>₹17,999</b>\n"
-        "<b>━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-        "<i>⚡ Spots limited. Premium profit mafia join karo.</i>\n\n"
-        f"<i>{RISK_DISCLAIMER}</i>"
-    )
-    btns = [
-        [InlineKeyboardButton("👑 BRONZE — ₹2,999", callback_data="plan_Bronze")],
-        [InlineKeyboardButton("🥈 SILVER — ₹6,999", callback_data="plan_Silver")],
-        [InlineKeyboardButton("🥇 GOLD — ₹9,999", callback_data="plan_Gold")],
-        [InlineKeyboardButton("💎 DIAMOND — ₹17,999", callback_data="plan_Diamond")]
-    ]
+    text = ("<b>🔥 EXCLUSIVE VIP ACCESS 🔥</b>\n\nMarket me log panic me hain, tu jackpot pick karna chahta hai?\n\n"
+            "<b>━━━━━━━━━━━━━━━━━━━━━</b>\n"
+            "👑 <b>BRONZE (30D)</b> ~~₹5,000~~ ➡️ <b>₹2,999</b>\n"
+            "🥈 <b>SILVER (90D)</b> ~~₹12,000~~ ➡️ <b>₹6,999</b>\n"
+            "🥇 <b>GOLD (6M)</b> ~~₹20,000~~ ➡️ <b>₹9,999</b>\n"
+            "💎 <b>DIAMOND (1Y)</b> ~~₹35,000~~ ➡️ <b>₹17,999</b>\n"
+            "<b>━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+            "<i>⚡ Strictly 1 Premium Call/Day. Quality > Quantity.</i>\n\n"
+            f"<i>{RISK_DISCLAIMER}</i>")
+    btns = [[InlineKeyboardButton(f"{'👑' if n=='Bronze' else '🥈' if n=='Silver' else '🥇' if n=='Gold' else '💎'} {n} — ₹{d['price']:,}", callback_data=f"plan_{n}")] for n,d in PLANS.items()]
     await u.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
 
 async def plan_cb(u, c):
@@ -249,7 +222,7 @@ async def spam_guard(u, c):
         try: await u.message.delete(); await db.ban_user(user.id, "Spam"); await c.bot.ban_chat_member(VIP_CHANNEL_ID, user.id)
         except: pass
 
-# ================= 5. SCHEDULER JOBS (FULL AUTO) =================
+# ================= 5. SCHEDULER JOBS (STRICT LIMITS) =================
 scheduler = AsyncIOScheduler(timezone="Asia/Kolkata")
 
 async def job_morning(app):
@@ -257,49 +230,48 @@ async def job_morning(app):
     if data: await safe_send(app.bot, FREE_CHANNEL_ID, fmt_morning(data))
 
 async def job_hype_poll(app):
-    """8:45 AM: Aggressive message + Poll"""
-    hype = (
-        "<b>⚡ MARKET KHULNE WALA HAI! SIR LAGAO DHAKKA! ⚡</b>\n\n"
-        "Saala crowd abhi confused hai. Smart money ne position li hai. "
-        "Aaj breakout ya breakdown pakka hai. Humari algo scannning chal rahi hai, "
-        "agar 1:3+ ka setup milega toh immediate fire karenge!\n\n"
-        "<b>👇 Neeche batayo, aaj kiski side me ho?</b>"
-    )
+    hype = ("<b>⚡ MARKET KHULNE WALA HAI! SIR LAGAO DHAKKA! ⚡</b>\n\n"
+            "Smart money position li hai. Algo scanning live hai.\n"
+            "Agar 1:3+ ka setup milega toh immediate fire karenge!\n\n<b>👇 Neeche batayo, aaj kiski side me ho?</b>")
     await safe_send(app.bot, FREE_CHANNEL_ID, hype)
-    try:
-        await app.bot.send_poll(
-            chat_id=FREE_CHANNEL_ID,
-            question="🔥 AAJ KA MARKET MOOD KYA HOGA? (Vote Karo)",
-            options=["🟢 BULLISH (Dabang Entry)", "🔴 BEARISH (Short Lagega)", "🟡 SIDEWAYS (Chhup ke baitho)"],
-            is_anonymous=False
-        )
+    try: await app.bot.send_poll(chat_id=FREE_CHANNEL_ID, question="🔥 AAJ KA MARKET MOOD?", options=["🟢 BULLISH", "🔴 BEARISH", "🟡 SIDEWAYS"], is_anonymous=False)
     except: pass
 
 async def job_auto_scanner(app):
-    """Runs every 5 mins in active windows to find trades"""
+    global LAST_AUTO_POST_TIME
     if not can_trade(): return
-    if await db.get_today_count() >= MAX_DAILY_TRADES: return
     
+    # ANTI-SPAM: Agar last 15 min me post hua hai toh skip
+    if time.time() - LAST_AUTO_POST_TIME < 900: return 
+
+    total = await db.get_today_count()
+    if total >= MAX_DAILY_TRADES: return # Hard limit hit
+
+    # STRICT ALLOCATION LOGIC
+    free_count = await db.get_today_free_count()
+    vip_count = await db.get_today_vip_count()
+
+    ch = None
+    if free_count < MAX_DAILY_FREE_TRADES:
+        ch = "FREE"
+    elif vip_count < MAX_DAILY_VIP_TRADES:
+        ch = "VIP"
+    else:
+        return # Daily specific quota full. STOP SCANNING.
+
     signal = auto_scan_algo()
     if signal:
-        fc = await db.get_today_free_count()
-        ch = "FREE" if fc < 2 else "VIP" # First 2 free, baaki VIP
         await post_call(signal["symbol"], signal["direction"], signal["entry"], signal["sl"], 
                        signal["t1"], signal["t2"], signal["t3"], signal["strategy"], ch, app.bot)
-        logger.info(f"AUTO-TRADE POSTED: {signal['symbol']} {signal['direction']}")
+        LAST_AUTO_POST_TIME = time.time() # Update cooldown
+        logger.info(f"AUTO-TRADE: {signal['symbol']} -> {ch} (Free:{free_count}/{MAX_DAILY_FREE_TRADES}, VIP:{vip_count}/{MAX_DAILY_VIP_TRADES})")
 
 async def job_btst(app):
-    """3:10 PM: BTST Call based on daily analysis"""
     data = get_real_candles("NIFTY", 50)
     if data is None or data.empty: return
     try:
-        c = round(data['Close'].iloc[-1], 2)
-        h = round(data['High'].max(), 2)
-        l = round(data['Low'].min(), 2)
-        sl = round(l - 20, 2)
-        t1 = round(c + 50, 2)
-        t2 = round(c + 100, 2)
-        await post_call("NIFTY", "BUY", c, sl, t1, t2, t2+50, "BTST_EOD", "VIP", app.bot)
+        c = round(data['Close'].iloc[-1], 2); l = round(data['Low'].min(), 2); sl = round(l - 20, 2)
+        await post_call("NIFTY", "BUY", c, sl, round(c+50,2), round(c+100,2), round(c+150,2), "BTST_EOD", "VIP", app.bot)
     except: pass
 
 async def job_oi(app):
@@ -357,14 +329,23 @@ async def start_webhook(app):
             sym = body.get("ticker","NIFTY").split(":")[-1].replace("FUT","").strip().upper()
             d = "BUY" if body.get("action","").lower() in ("buy","long") else "SELL" if body.get("action","").lower() in ("sell","short") else None
             if not d or float(body.get("price",0))<=0: return web.json_response({"status": "invalid"})
+            
+            # Apply strict limits to webhooks too
+            total = await db.get_today_count()
+            if total >= MAX_DAILY_TRADES: return web.json_response({"status": "daily_limit_reached"})
+            
+            free_count = await db.get_today_free_count()
+            vip_count = await db.get_today_vip_count()
+            ch = "FREE" if free_count < MAX_DAILY_FREE_TRADES else "VIP" if vip_count < MAX_DAILY_VIP_TRADES else None
+            if not ch: return web.json_response({"status": "quota_full"})
+            
             p = float(body.get("price",0)); rp = p*0.003
             sl = round(p-rp,2) if d=="BUY" else round(p+rp,2)
             t1 = round(p+rp,2) if d=="BUY" else round(p-rp,2)
             t2 = round(p+rp*2,2) if d=="BUY" else round(p-rp*2,2)
             t3 = round(p+rp*3,2) if d=="BUY" else round(p-rp*3,2)
-            fc = await db.get_today_free_count(); ch = "FREE" if fc<2 else "VIP"
             tid = await post_call(sym, d, p, sl, t1, t2, t3, "WEBHOOK", ch, app.bot)
-            return web.json_response({"status": "posted", "id": tid})
+            return web.json_response({"status": "posted", "id": tid, "channel": ch})
         except Exception as e: return web.json_response({"error": str(e)}, status=500)
 
     async def pay_handler(request):
