@@ -1,4 +1,5 @@
 import os, logging, sys, asyncio
+from handlers.subscription import register_subscription_handlers
 from telegram import Update
 from telegram.ext import ApplicationBuilder
 from config import validate_config, BOT_TOKEN
