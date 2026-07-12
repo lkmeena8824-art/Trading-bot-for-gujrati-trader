@@ -30,60 +30,119 @@ class Database:
     async def close(self):
         if self._conn: await self._conn.close()
         
+    async def get_user(self, tid):
+        c = await self._conn.execute("SELECT * FROM users WHERE telegram_id=?", (tid,))
+        r = await c.fetchone()
+        return dict(r) if r else None
+
     async def upsert_user(self, tid, username=None, fn=None, ref_by=None):
-        await self._conn.execute("INSERT INTO users VALUES (?,?,?,0,?,CURRENT_TIMESTAMP) ON CONFLICT(telegram_id) DO UPDATE SET username=COALESCE(?,username), first_name=COALESCE(?,first_name), referred_by=COALESCE(?,referred_by), last_active=CURRENT_TIMESTAMP", (tid, username, fn, ref_by, username, fn, ref_by)); await self._conn.commit()
+        await self._conn.execute(
+            "INSERT INTO users VALUES (?,?,?,0,?,CURRENT_TIMESTAMP) ON CONFLICT(telegram_id) DO UPDATE SET username=COALESCE(?,username), first_name=COALESCE(?,first_name), referred_by=COALESCE(?,referred_by), last_active=CURRENT_TIMESTAMP", 
+            (tid, username, fn, ref_by, username, fn, ref_by)
+        )
+        await self._conn.commit()
         
     async def ban_user(self, tid, reason="Spam"):
-        await self._conn.execute("INSERT OR REPLACE INTO spam_blacklist VALUES (?,?)", (tid, reason)); await self._conn.commit()
+        await self._conn.execute("INSERT OR REPLACE INTO spam_blacklist VALUES (?,?)", (tid, reason))
+        await self._conn.commit()
         
     async def add_subscription(self, uid, plan):
-        p = PLANS[plan]; now = datetime.now(); end = now + timedelta(days=p["duration_days"])
-        c = await self._conn.execute("INSERT INTO subscriptions (user_id,plan_name,start_date,end_date) VALUES (?,?,?,?)", (uid, plan, now.isoformat(), end.isoformat())); await self._conn.commit(); return c.lastrowid
+        p = PLANS[plan]
+        now = datetime.now()
+        end = now + timedelta(days=p["duration_days"])
+        c = await self._conn.execute(
+            "INSERT INTO subscriptions (user_id, plan_name, start_date, end_date) VALUES (?,?,?,?)", 
+            (uid, plan, now.isoformat(), end.isoformat())
+        )
+        await self._conn.commit()
+        return c.lastrowid
         
+    async def extend_subscription(self, uid, extra_days):
+        # FIX: Used simple string concatenation instead of nested f-string
+        await self._conn.execute(
+            f"UPDATE subscriptions SET end_date = datetime(end_date, '+{extra_days} days') WHERE user_id=? AND is_active=1", 
+            (extra_days, uid)
+        )
+        await self._conn.commit()
+
     async def get_active_sub(self, uid):
-        c = await self._conn.execute("SELECT * FROM subscriptions WHERE user_id=? AND is_active=1 AND end_date>?", (uid, datetime.now().isoformat())); r = await c.fetchone(); return dict(r) if r else None
+        c = await self._conn.execute(
+            "SELECT * FROM subscriptions WHERE user_id=? AND is_active=1 AND end_date>?", 
+            (uid, datetime.now().isoformat())
+        )
+        r = await c.fetchone()
+        return dict(r) if r else None
         
     async def get_expired_subs(self):
-        c = await self._conn.execute("SELECT * FROM subscriptions WHERE is_active=1 AND end_date<=?", (datetime.now().isoformat(),)); return [dict(r) for r in await c.fetchall()]
+        c = await self._conn.execute(
+            "SELECT * FROM subscriptions WHERE is_active=1 AND end_date<=?", 
+            (datetime.now().isoformat(),)
+        )
+        return [dict(r) for r in await c.fetchall()]
         
     async def deactivate_sub(self, sid):
-        await self._conn.execute("UPDATE subscriptions SET is_active=0 WHERE id=?", (sid,)); await self._conn.commit()
+        await self._conn.execute("UPDATE subscriptions SET is_active=0 WHERE id=?", (sid,))
+        await self._conn.commit()
         
     async def create_trade(self, sym, dir, e, sl, t1, t2, t3, strat, ch, mid=None):
-        c = await self._conn.execute("INSERT INTO trades (symbol,direction,entry_price,sl,target1,target2,target3,current_sl,strategy,channel_type,message_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)", (sym, dir, e, sl, t1, t2, t3, sl, strat, ch, mid)); await self._conn.commit(); return c.lastrowid
+        c = await self._conn.execute(
+            "INSERT INTO trades (symbol,direction,entry_price,sl,target1,target2,target3,current_sl,strategy,channel_type,message_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)", 
+            (sym, dir, e, sl, t1, t2, t3, sl, strat, ch, mid)
+        )
+        await self._conn.commit()
+        return c.lastrowid
         
     async def get_trade(self, tid):
-        c = await self._conn.execute("SELECT * FROM trades WHERE id=?", (tid,)); r = await c.fetchone(); return dict(r) if r else None
+        c = await self._conn.execute("SELECT * FROM trades WHERE id=?", (tid,))
+        r = await c.fetchone()
+        return dict(r) if r else None
         
     async def get_active_trades(self):
-        c = await self._conn.execute("SELECT * FROM trades WHERE status='ACTIVE'"); return [dict(r) for r in await c.fetchall()]
+        c = await self._conn.execute("SELECT * FROM trades WHERE status='ACTIVE'")
+        return [dict(r) for r in await c.fetchall()]
         
     async def update_trade(self, tid, **kw):
         if not kw: return
-        kw["updated_at"] = datetime.now().isoformat(); s = ", ".join(f"{k}=?" for k in kw); v = list(kw.values()) + [tid]
-        await self._conn.execute(f"UPDATE trades SET {s} WHERE id=?", v); await self._conn.commit()
+        kw["updated_at"] = datetime.now().isoformat()
+        s = ", ".join(f"{k}=?" for k in kw)
+        v = list(kw.values()) + [tid]
+        await self._conn.execute(f"UPDATE trades SET {s} WHERE id=?", v)
+        await self._conn.commit()
         
     async def get_today_trades(self):
-        td = datetime.now().strftime("%Y-%m-%d"); c = await self._conn.execute("SELECT * FROM trades WHERE DATE(created_at)=?", (td,)); return [dict(r) for r in await c.fetchall()]
+        td = datetime.now().strftime("%Y-%m-%d")
+        c = await self._conn.execute("SELECT * FROM trades WHERE DATE(created_at)=?", (td,))
+        return [dict(r) for r in await c.fetchall()]
         
     async def get_today_count(self):
-        td = datetime.now().strftime("%Y-%m-%d"); c = await self._conn.execute("SELECT COUNT(*) as c FROM trades WHERE DATE(created_at)=?", (td,)); r = await c.fetchone(); return r["c"] if r else 0
+        td = datetime.now().strftime("%Y-%m-%d")
+        c = await self._conn.execute("SELECT COUNT(*) as c FROM trades WHERE DATE(created_at)=?", (td,))
+        r = await c.fetchone()
+        return r["c"] if r else 0
         
     async def get_today_free_count(self):
-        td = datetime.now().strftime("%Y-%m-%d"); c = await self._conn.execute("SELECT COUNT(*) as c FROM trades WHERE DATE(created_at)=? AND channel_type='FREE'", (td,)); r = await c.fetchone(); return r["c"] if r else 0
+        td = datetime.now().strftime("%Y-%m-%d")
+        c = await self._conn.execute("SELECT COUNT(*) as c FROM trades WHERE DATE(created_at)=? AND channel_type='FREE'", (td,))
+        r = await c.fetchone()
+        return r["c"] if r else 0
         
-    # NEW: VIP Count Function added
     async def get_today_vip_count(self):
-        td = datetime.now().strftime("%Y-%m-%d"); c = await self._conn.execute("SELECT COUNT(*) as c FROM trades WHERE DATE(created_at)=? AND channel_type='VIP'", (td,)); r = await c.fetchone(); return r["c"] if r else 0
+        td = datetime.now().strftime("%Y-%m-%d")
+        c = await self._conn.execute("SELECT COUNT(*) as c FROM trades WHERE DATE(created_at)=? AND channel_type='VIP'", (td,))
+        r = await c.fetchone()
+        return r["c"] if r else 0
         
     async def update_stats(self, dt, **kw):
         c = await self._conn.execute("SELECT id FROM bot_stats WHERE stat_date=?", (dt,))
         if await c.fetchone():
-            s = ", ".join(f"{k}=COALESCE({k},0)+?" for k in kw); v = list(kw.values()) + [dt]
+            s = ", ".join(f"{k}=COALESCE({k},0)+?" for k in kw)
+            v = list(kw.values()) + [dt]
             await self._conn.execute(f"UPDATE bot_stats SET {s} WHERE stat_date=?", v)
         else:
-            cols, vals = ["stat_date"]+list(kw.keys()), [dt]+list(kw.values())
-            await self._conn.execute(f"INSERT INTO bot_stats ({','.join(cols)}) VALUES ({','.join(['?']*len(cols))})", vals)
+            cols = ["stat_date"] + list(kw.keys())
+            vals = [dt] + list(kw.values())
+            placeholders = ", ".join(["?"] * len(cols))
+            await self._conn.execute(f"INSERT INTO bot_stats ({cols}) VALUES ({placeholders})", vals)
         await self._conn.commit()
 
 db = Database()
