@@ -71,11 +71,23 @@ The default `GIFT_NIFTY_TICKER` is `^NSEI`, which is labelled in the message as 
 
 ## Run locally
 
+The private environment file belongs here:
+
+```text
+/home/user/Trading-bot-for-gujrati-trader/.env
+```
+
+Do not paste its values into chat or commit it. `python-dotenv` loads it automatically when the bot is started from the repository root. `requirements.txt` is already in the repository root and is installed with the command below.
+
 1. Create a Python 3.12 virtual environment.
 2. Install `requirements.txt`.
-3. Create `.env` with the required Telegram values.
-4. Run `python bot.py`.
-5. Keep `data/` persistent because it contains the trade ledger and subscription database.
+3. Copy your private `.env` into the repository root.
+4. Run the safe preflight: `python preflight.py`.
+5. Optionally test free market endpoints without publishing a trade: `python preflight.py --network`.
+6. Run `python bot.py`.
+7. Keep `data/` persistent because it contains the trade ledger and subscription database.
+
+Preflight never prints secrets and never creates a Telegram trade. It is the next command to run after placing `.env`.
 
 ## Docker
 
