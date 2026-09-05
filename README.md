@@ -89,6 +89,10 @@ Do not paste its values into chat or commit it. `python-dotenv` loads it automat
 
 Preflight never prints secrets and never creates a Telegram trade. It is the next command to run after placing `.env`.
 
+## Live hosting
+
+The complete zero-cost deployment guide is in [`DEPLOYMENT.md`](DEPLOYMENT.md). The recommended host is an Oracle Cloud Always Free VM with a persistent `data/` directory and a systemd service. Render's free web service sleeps and has ephemeral local storage, so it is not suitable for this scheduler/database bot.
+
 ## Docker
 
 Build the image and run it with a persistent host directory mounted at `/app/data`. Use one bot process so APScheduler has a single owner. Configure a staging bot/channel before enabling production alerts.

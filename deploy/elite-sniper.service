@@ -1,0 +1,18 @@
+[Unit]
+Description=Elite Sniper Telegram Bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=elitebot
+Group=elitebot
+WorkingDirectory=/opt/elite-sniper
+EnvironmentFile=/opt/elite-sniper/.env
+ExecStart=/opt/elite-sniper/.venv/bin/python /opt/elite-sniper/bot.py
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
