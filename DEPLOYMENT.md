@@ -129,7 +129,39 @@ Expected shape:
 
 Keep port 8080 private unless a correctly authenticated HTTPS reverse proxy is configured. Set `WEBHOOK_SECRET` before exposing the webhook endpoints.
 
-## Option B — Docker on the VM
+## Option B — Existing Render deployment
+
+Yes, the same GitHub → Render process can be used. The repository now includes `render.yaml` configured for the fixed session branch and Docker health check.
+
+In Render:
+
+1. Open the existing service.
+2. Confirm the service is connected to this repository.
+3. Set the deploy branch to `arena/01a06f74-trading-bot-for-gujrati-trader`.
+4. Use Docker runtime and the repository `Dockerfile`, or create a new Blueprint from `render.yaml`.
+5. Keep the existing secret environment variables in Render's Environment page; do not commit them and do not paste them into chat.
+6. Confirm these non-secret values:
+   - `DATABASE_PATH=/app/data/bot.db`
+   - `MAX_DAILY_TRADES=3`
+   - `DATA_PROVIDER=free`
+   - `AI_ENABLED=false`
+7. Deploy the latest commit and inspect the deploy logs.
+8. Check the Render health URL ending in `/health`.
+
+The current Dockerfile already binds the aiohttp server to `0.0.0.0` and reads Render's `PORT` variable. Telegram polling does not require a public Telegram webhook port.
+
+### Render free-plan warning
+
+Render Free can run the container for testing, but its documented sleep and ephemeral-filesystem behavior means:
+
+- APScheduler jobs can stop while the service sleeps.
+- The SQLite file can disappear after restart/redeploy.
+- Daily trade limits and subscription/trade history may reset.
+- A free service is not a dependable 24/7 production host for this SQLite scheduler bot.
+
+If the current Render service is on a paid always-on plan, the Render deployment path is suitable. If it is genuinely Free, use Render for staging or accept the persistence/uptime limitation; Oracle Always Free VM remains the better zero-cost production path.
+
+## Option C — Docker on the VM
 
 From `/opt/elite-sniper`, after placing `.env` in the repository root:
 

@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: elite-sniper-bot
+    runtime: docker
+    plan: free
+    branch: arena/01a06f74-trading-bot-for-gujrati-trader
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: FREE_CHANNEL_ID
+        sync: false
+      - key: VIP_CHANNEL_ID
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: DATABASE_PATH
+        value: /app/data/bot.db
+      - key: MAX_DAILY_TRADES
+        value: "3"
+      - key: DATA_PROVIDER
+        value: free
+      - key: SIGNAL_SYMBOL
+        value: NIFTY
+      - key: AUTO_TRADE_CHANNEL
+        value: FREE
+      - key: AI_ENABLED
+        value: "false"

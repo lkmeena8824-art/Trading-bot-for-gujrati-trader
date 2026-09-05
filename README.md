@@ -91,7 +91,7 @@ Preflight never prints secrets and never creates a Telegram trade. It is the nex
 
 ## Live hosting
 
-The complete zero-cost deployment guide is in [`DEPLOYMENT.md`](DEPLOYMENT.md). The recommended host is an Oracle Cloud Always Free VM with a persistent `data/` directory and a systemd service. Render's free web service sleeps and has ephemeral local storage, so it is not suitable for this scheduler/database bot.
+The complete deployment guide is in [`DEPLOYMENT.md`](DEPLOYMENT.md). The repository also includes `render.yaml` for the existing GitHub → Render workflow. If the Render service is on a paid always-on plan, use it normally; Render Free sleeps and has ephemeral local storage, so Oracle Cloud Always Free VM with a persistent `data/` directory is the safer zero-cost production path.
 
 ## Docker
 
