@@ -137,7 +137,7 @@ In Render:
 
 1. Open the existing service.
 2. Confirm the service is connected to this repository.
-3. Set the deploy branch to `arena/01a06f74-trading-bot-for-gujrati-trader`.
+3. Set the deploy branch to the branch you actually ship (`main` after the Phase 1 merge, or `arena/01a06fdf-trading-bot-for-gujrati-trader` while testing Phase 2). `render.yaml` currently points at the Phase 2 session branch.
 4. Use Docker runtime and the repository `Dockerfile`, or create a new Blueprint from `render.yaml`.
 5. Keep the existing secret environment variables in Render's Environment page; do not commit them and do not paste them into chat.
 6. Confirm these non-secret values:
@@ -145,6 +145,7 @@ In Render:
    - `MAX_DAILY_TRADES=3`
    - `DATA_PROVIDER=free`
    - `AI_ENABLED=false`
+   - Phase 2 variables from the table in [Phase 2 environment variables](#phase-2-environment-variables)
 7. Deploy the latest commit and inspect the deploy logs.
 8. Check the Render health URL ending in `/health`.
 
@@ -160,6 +161,98 @@ Render Free can run the container for testing, but its documented sleep and ephe
 - A free service is not a dependable 24/7 production host for this SQLite scheduler bot.
 
 If the current Render service is on a paid always-on plan, the Render deployment path is suitable. If it is genuinely Free, use Render for staging or accept the persistence/uptime limitation; Oracle Always Free VM remains the better zero-cost production path.
+
+
+## Phase 2 environment variables
+
+Phase 2 adds an **optional** AI wording layer, poll/community memory, daily
+market memory and contextual replies. Everything below is safe to leave at its
+default: with `AI_ENABLED=false` the bot behaves exactly like Phase 1 and costs
+nothing beyond hosting.
+
+### Core (unchanged)
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `BOT_TOKEN` | — | Secret. Render → Environment. |
+| `FREE_CHANNEL_ID` / `VIP_CHANNEL_ID` | — | Secret-ish channel IDs. |
+| `ADMIN_IDS` | — | Comma separated Telegram user IDs. |
+| `DATABASE_PATH` | `./data/bot.db` | Use `/app/data/bot.db` on Render/Docker. |
+| `PORT` | `8080` | Render injects this automatically. |
+| `WEBHOOK_SECRET` | empty | Required before exposing webhooks. |
+| `MAX_DAILY_TRADES` | `3` | Hard quality cap, 1–3. |
+| `DATA_PROVIDER` / `SIGNAL_SYMBOL` / `AUTO_TRADE_CHANNEL` | `free` / `NIFTY` / `FREE` | Unchanged. |
+
+### AI provider abstraction (optional, billed by the provider)
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `AI_ENABLED` | `false` | Master switch. `false` = zero-cost deterministic templates, no API call is ever made. |
+| `AI_PROVIDER` | `openai` | `openai`, `gemini`, `auto` (OpenAI first, then Gemini) or `none`. |
+| `OPENAI_API_KEY` | empty | Secret. Required for the OpenAI provider. |
+| `OPENAI_MODEL` | `gpt-4o-mini` | Any chat-completions model. |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Override for a compatible gateway. |
+| `GEMINI_API_KEY` | empty | Secret. Required for the Gemini provider. |
+| `GEMINI_MODEL` | `gemini-1.5-flash` | Any `generateContent` model. |
+| `GEMINI_BASE_URL` | `https://generativelanguage.googleapis.com/v1beta` | Override if needed. |
+| `AI_MIN_INTERVAL_SECONDS` | `15` | Minimum gap between AI calls. |
+| `AI_TIMEOUT_SECONDS` | `8` | Per-call timeout; on timeout the template is used. |
+| `AI_MAX_TOKENS` | `350` | Output cap. |
+| `AI_TEMPERATURE` | `0.3` | Lower is safer/steadier. |
+| `AI_DAILY_CALL_BUDGET` | `200` | Hard daily spend guard; after this the bot returns to templates. |
+| `AI_PERSONA_NAME` | `Sniper Bhai` | Persona name used in wording. |
+| `AI_STYLE_LANGUAGE` | `hinglish` | `hinglish`, `english` or `gujarati`. |
+
+If `AI_ENABLED=true` but no key is present, the bot logs a warning and keeps
+using the free templates. It never fails to post because of AI.
+
+### Contextual replies
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `REPLY_ENABLED` | `true` | Human-style replies. Works without AI (deterministic templates). |
+| `REPLY_COOLDOWN_SECONDS` | `20` | Per-user cooldown. |
+| `REPLY_MAX_PER_USER_PER_DAY` | `15` | Per-user daily cap. |
+| `REPLY_IN_GROUPS` | `false` | When `true`, the bot also answers in Free/VIP groups, but only if it is mentioned or replied to. |
+
+### Memory
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `COMMUNITY_MEMORY_ENABLED` | `true` | Stores per-member participation and usual poll leaning. |
+| `POLL_TRACKING_ENABLED` | `true` | Stores who answered the daily sentiment poll and how. |
+| `MARKET_MEMORY_DAYS` | `5` | How many recent market days the reply context summarises. |
+
+New SQLite tables (`polls`, `poll_answers`, `community_memory`,
+`market_memory`, `ai_usage`) are created automatically on startup. The
+migration is additive; an existing `bot.db` from Phase 1 keeps working.
+
+### Enabling AI on Render safely
+
+1. Add `OPENAI_API_KEY` (or `GEMINI_API_KEY`) as a secret environment variable.
+2. Set `AI_PROVIDER` accordingly and `AI_ENABLED=true`.
+3. Keep `AI_DAILY_CALL_BUDGET` low (for example `50`) for the first day.
+4. Redeploy and watch the logs for `AI text rejected by fact guard` lines — each
+   one means the deterministic message was published instead.
+5. Run `/aistatus` from an admin account to see provider, budget usage, guard
+   rejections and memory counters.
+6. To roll back to zero cost, set `AI_ENABLED=false` and redeploy. No other
+   change is needed.
+
+### What AI is not allowed to do
+
+The guard in `ai_guard.py` mechanically rejects any AI output that:
+
+- contains a number that is not already in the facts or the deterministic draft
+  (so entry, SL, T1/T2/T3, RRR, OI and P&L can never be altered),
+- introduces or flips a BUY/SELL/CE/PE direction,
+- drops a critical number that the deterministic draft published,
+- promises profit, guarantees accuracy or claims "no risk",
+- uses markup outside the Telegram-safe subset.
+
+Rejected output is replaced by the deterministic text and logged. The signal
+engine remains the only component that decides direction, entry, SL, targets,
+RRR and OI interpretation.
 
 ## Option C — Docker on the VM
 
@@ -192,6 +285,8 @@ sudo journalctl -u elite-sniper -n 100 --no-pager
 - Confirm `.env` is mode `600` and is not tracked by Git.
 - Confirm `MAX_DAILY_TRADES=3`.
 - Keep `AI_ENABLED=false` for the zero-cost setup.
+- If AI is enabled, confirm `/aistatus` shows the expected provider and budget.
+- Confirm the daily poll appears and `/aistatus` shows voters after members vote.
 - Confirm `/health` and `systemctl status`.
 - Confirm morning, poll, open-pulse and no-trade jobs in logs.
 - Confirm free option-chain data is fresh before enabling live calls.

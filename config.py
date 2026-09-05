@@ -40,11 +40,43 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
 # The bot remains zero-cost by default. AI is strictly opt-in because hosted
 # LLM APIs are not free. Deterministic templates are the default fallback.
+#
+# Phase 2 keeps that contract: AI is a *wording* layer only. It never decides
+# BUY/SELL and it can never change entry, SL, targets, RRR, OI or P&L numbers.
 AI_ENABLED = _bool_env("AI_ENABLED", False)
-AI_PROVIDER = os.getenv("AI_PROVIDER", "openai").lower()
+# openai | gemini | auto | none
+AI_PROVIDER = os.getenv("AI_PROVIDER", "openai").strip().lower()
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+GEMINI_BASE_URL = os.getenv(
+    "GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta"
+).rstrip("/")
+
 AI_MIN_INTERVAL_SECONDS = _int_env("AI_MIN_INTERVAL_SECONDS", 15)
+AI_TIMEOUT_SECONDS = _int_env("AI_TIMEOUT_SECONDS", 8)
+AI_MAX_TOKENS = _int_env("AI_MAX_TOKENS", 350)
+AI_TEMPERATURE = _float_env("AI_TEMPERATURE", 0.3)
+# Hard spend guard: once the day's budget is used, deterministic templates run.
+AI_DAILY_CALL_BUDGET = _int_env("AI_DAILY_CALL_BUDGET", 200)
+AI_PERSONA_NAME = os.getenv("AI_PERSONA_NAME", "Sniper Bhai")
+AI_STYLE_LANGUAGE = os.getenv("AI_STYLE_LANGUAGE", "hinglish").strip().lower()
+
+# Contextual human-style replies. These work with or without AI: the template
+# layer is deterministic and free, AI only rephrases it when enabled.
+REPLY_ENABLED = _bool_env("REPLY_ENABLED", True)
+REPLY_COOLDOWN_SECONDS = _int_env("REPLY_COOLDOWN_SECONDS", 20)
+REPLY_MAX_PER_USER_PER_DAY = _int_env("REPLY_MAX_PER_USER_PER_DAY", 15)
+REPLY_IN_GROUPS = _bool_env("REPLY_IN_GROUPS", False)
+
+# Community memory (poll answers, participation) and daily market memory.
+COMMUNITY_MEMORY_ENABLED = _bool_env("COMMUNITY_MEMORY_ENABLED", True)
+POLL_TRACKING_ENABLED = _bool_env("POLL_TRACKING_ENABLED", True)
+MARKET_MEMORY_DAYS = _int_env("MARKET_MEMORY_DAYS", 5)
 
 PAYMENT_DETAILS_TEXT = os.getenv(
     "PAYMENT_DETAILS_TEXT",
@@ -160,6 +192,29 @@ ENABLE_BTST = _bool_env("ENABLE_BTST", False)
 AUTO_TRADE_CHANNEL = os.getenv("AUTO_TRADE_CHANNEL", "FREE").upper()
 
 
+def active_ai_provider() -> str:
+    """Resolve which provider would actually be used right now.
+
+    Returns "none" whenever the bot must stay in zero-cost deterministic mode.
+    """
+    if not AI_ENABLED:
+        return "none"
+    provider = AI_PROVIDER
+    if provider in {"", "none", "off", "disabled"}:
+        return "none"
+    if provider == "auto":
+        if OPENAI_API_KEY:
+            return "openai"
+        if GEMINI_API_KEY:
+            return "gemini"
+        return "none"
+    if provider == "openai":
+        return "openai" if OPENAI_API_KEY else "none"
+    if provider == "gemini":
+        return "gemini" if GEMINI_API_KEY else "none"
+    return "none"
+
+
 def validate_config() -> bool:
     errors = []
     if not BOT_TOKEN:
@@ -172,8 +227,13 @@ def validate_config() -> bool:
         errors.append("ADMIN_IDS")
     if MAX_DAILY_TRADES < 1 or MAX_DAILY_TRADES > 3:
         errors.append("MAX_DAILY_TRADES must be between 1 and 3")
+    if AI_PROVIDER not in {"openai", "gemini", "auto", "none", "off", "disabled", ""}:
+        errors.append("AI_PROVIDER must be openai, gemini, auto or none")
 
     if errors:
         print("❌ CONFIG ERRORS: " + ", ".join(errors))
         return False
+
+    if AI_ENABLED and active_ai_provider() == "none":
+        print("⚠️  AI_ENABLED=true but no usable provider key; deterministic templates will be used.")
     return True

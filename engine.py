@@ -19,12 +19,16 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    PollAnswerHandler,
     filters,
 )
 
 from config import (
     ADMIN_IDS,
+    AI_DAILY_CALL_BUDGET,
     AUTO_TRADE_CHANNEL,
+    REPLY_ENABLED,
+    REPLY_IN_GROUPS,
     ENABLE_BTST,
     FREE_CHANNEL_ID,
     MAX_DAILY_TRADES,
@@ -43,7 +47,6 @@ from config import (
 from database import db
 from market_data import fetch_candles, get_real_candles, market_data
 from messaging import (
-    ai_or_fallback,
     fmt_closing_summary,
     fmt_fomo,
     fmt_morning,
@@ -57,6 +60,10 @@ from messaging import (
     fmt_trade,
     fmt_update,
 )
+import community
+import market_memory
+import replies
+from message_ai import ai_stats, generate_message
 from quality_control import (
     is_market_day,
     is_market_session_open,
@@ -268,30 +275,77 @@ scheduler = AsyncIOScheduler(timezone="Asia/Kolkata")
 async def job_morning(app) -> None:
     data = await market_data.morning_data()
     fallback = fmt_morning(data)
-    text = await ai_or_fallback("morning_brief", data, fallback)
+    # Daily market memory starts here: pre-open cues are stored as engine facts.
+    await market_memory.remember_premarket(data)
+    context = {"market_memory": await market_memory.reply_context()}
+    text = await generate_message("morning_brief", data, fallback, context=context)
     await safe_send(app.bot, FREE_CHANNEL_ID, text)
+
+
+POLL_QUESTION = "🧠 AAJ KA SMART MONEY SENTIMENT?"
+POLL_OPTIONS = [
+    "🟢 Aggressive Long",
+    "🔴 Defensive Short",
+    "🟡 Sideways Trap",
+    "🛡️ No Trade",
+]
 
 
 async def job_hype_poll(app) -> None:
     await safe_send(app.bot, FREE_CHANNEL_ID, fmt_poll_intro())
     try:
-        await app.bot.send_poll(
+        message = await app.bot.send_poll(
             chat_id=FREE_CHANNEL_ID,
-            question="🧠 AAJ KA SMART MONEY SENTIMENT?",
-            options=[
-                "🟢 Aggressive Long",
-                "🔴 Defensive Short",
-                "🟡 Sideways Trap",
-                "🛡️ No Trade",
-            ],
+            question=POLL_QUESTION,
+            options=POLL_OPTIONS,
             is_anonymous=False,
         )
     except TelegramError as exc:
         logger.error("Poll failed: %s", exc)
+        return
+
+    poll = getattr(message, "poll", None)
+    if poll is not None:
+        # Remember the poll so every incoming answer can be attributed.
+        await community.remember_poll(
+            poll_id=str(poll.id),
+            question=POLL_QUESTION,
+            options=list(POLL_OPTIONS),
+            chat_id=FREE_CHANNEL_ID,
+            message_id=getattr(message, "message_id", None),
+        )
+
+
+async def on_poll_answer(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Track who voted for what and update community memory."""
+    answer = update.poll_answer
+    if answer is None:
+        return
+    user = getattr(answer, "user", None)
+    if user is None:
+        return
+    result = await community.record_answer(
+        poll_id=str(answer.poll_id),
+        user_id=user.id,
+        option_ids=list(answer.option_ids or []),
+        username=user.username,
+        first_name=user.first_name,
+    )
+    if result:
+        logger.info(
+            "Poll answer recorded: user=%s options=%s retracted=%s",
+            user.id,
+            result.get("options"),
+            result.get("retracted"),
+        )
+
 
 
 async def job_premarket(app) -> None:
-    await safe_send(app.bot, FREE_CHANNEL_ID, fmt_premarket())
+    fallback = fmt_premarket()
+    context = {"market_memory": await market_memory.reply_context(), "community": await community.snapshot()}
+    text = await generate_message("premarket_hype", {"phase": "PRE_MARKET"}, fallback, context=context)
+    await safe_send(app.bot, FREE_CHANNEL_ID, text)
 
 
 async def _spot_dict(symbol: str) -> dict:
@@ -302,7 +356,14 @@ async def _spot_dict(symbol: str) -> dict:
 
 async def job_open_pulse(app) -> None:
     nifty, banknifty = await asyncio.gather(_spot_dict("NIFTY"), _spot_dict("BANKNIFTY"))
-    await safe_send(app.bot, FREE_CHANNEL_ID, fmt_open_pulse(nifty, banknifty))
+    fallback = fmt_open_pulse(nifty, banknifty)
+    await market_memory.remember_open(nifty, banknifty)
+    text = await generate_message(
+        "open_pulse",
+        {"nifty": nifty, "banknifty": banknifty},
+        fallback,
+    )
+    await safe_send(app.bot, FREE_CHANNEL_ID, text)
 
 
 async def _select_channel() -> str:
@@ -317,12 +378,14 @@ async def job_auto_scanner(app) -> None:
         return
     snapshot = await market_data.snapshot(SIGNAL_SYMBOL)
     decision = build_signal(snapshot, slot)
+    # The engine's verdict (and only the engine's verdict) enters daily memory.
+    await market_memory.remember_decision(slot, decision)
     if not decision.signal:
         logger.info("No signal in %s: %s", slot, "; ".join(decision.reasons))
         return
     channel = await _select_channel()
     signal = decision.signal
-    await post_call(
+    trade_id = await post_call(
         signal["symbol"],
         signal["direction"],
         signal["entry"],
@@ -345,6 +408,8 @@ async def job_auto_scanner(app) -> None:
         risk_points=signal["risk_points"],
         rrr=signal["rrr"],
     )
+    if trade_id:
+        await market_memory.remember_trade_posted({**signal, "slot": slot}, trade_id)
 
 
 async def job_no_trade_check(app) -> None:
@@ -352,12 +417,22 @@ async def job_no_trade_check(app) -> None:
         return
     snapshot = await market_data.snapshot(SIGNAL_SYMBOL)
     decision = build_signal(snapshot)
+    await market_memory.remember_decision(slot_for_time(), decision)
     if decision.data_unavailable:
         logger.info("No-trade checkpoint skipped because data is unavailable")
         return
     reason = decision.reasons[0] if decision.reasons else "no A+ setup confirmed"
-    if await db.mark_no_trade(state="NO_TRADE_ZONE" if decision.no_trade_zone else "NO_CONFIRMED_SETUP"):
-        await safe_send(app.bot, FREE_CHANNEL_ID, fmt_no_trade(reason))
+    state = "NO_TRADE_ZONE" if decision.no_trade_zone else "NO_CONFIRMED_SETUP"
+    if await db.mark_no_trade(state=state):
+        await market_memory.remember_no_trade(state, reason)
+        fallback = fmt_no_trade(reason)
+        text = await generate_message(
+            "no_trade",
+            {"reason": reason, "state": state},
+            fallback,
+            context={"market_memory": await market_memory.reply_context()},
+        )
+        await safe_send(app.bot, FREE_CHANNEL_ID, text)
 
 
 async def job_btst(app) -> None:
@@ -391,7 +466,20 @@ async def job_closing(app) -> None:
         _spot_dict("BANKNIFTY"),
     )
     trades = await db.get_today_trades()
-    text = fmt_closing_summary(nifty, banknifty, trades)
+    crowd = await community.snapshot()
+    await market_memory.remember_close(trades, nifty, banknifty)
+    fallback = fmt_closing_summary(nifty, banknifty, trades) + "\n\n" + community.describe_snapshot(crowd)
+    text = await generate_message(
+        "closing_summary",
+        {
+            "nifty": nifty,
+            "banknifty": banknifty,
+            "trades_count": len(trades),
+            "community": crowd,
+        },
+        fallback,
+        context={"market_memory": await market_memory.reply_context()},
+    )
     await safe_send(app.bot, FREE_CHANNEL_ID, text)
     if trades:
         await safe_send(app.bot, VIP_CHANNEL_ID, text)
@@ -399,7 +487,27 @@ async def job_closing(app) -> None:
 
 async def job_pnl(app) -> None:
     trades = await db.get_today_trades()
-    text = fmt_pnl(trades)
+    fallback = fmt_pnl(trades)
+    total_points = sum(
+        float(trade.get("realized_points") or trade.get("points_gained") or 0) for trade in trades
+    )
+    text = await generate_message(
+        "pnl_report",
+        {
+            "trades": [
+                {
+                    "symbol": trade.get("symbol"),
+                    "status": trade.get("status"),
+                    "points": float(trade.get("realized_points") or trade.get("points_gained") or 0),
+                }
+                for trade in trades
+            ],
+            "net_points": round(total_points, 2),
+            "count": len(trades),
+        },
+        fallback,
+        context={"market_memory": await market_memory.reply_context()},
+    )
     await safe_send(app.bot, FREE_CHANNEL_ID, text)
     if trades:
         await safe_send(app.bot, VIP_CHANNEL_ID, text)
@@ -695,6 +803,93 @@ async def spam_guard(update, context: ContextTypes.DEFAULT_TYPE) -> None:
             pass
 
 
+async def contextual_reply(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Human-style contextual reply built from community + market memory.
+
+    Works fully in zero-cost mode: the template layer is deterministic and AI,
+    when enabled, only rephrases it under the fact guard. The reply never
+    contains a BUY/SELL recommendation or any number that is not already a
+    stored fact.
+    """
+    if not REPLY_ENABLED:
+        return
+    message = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+    if not message or not user or not chat or user.is_bot:
+        return
+    text = (message.text or message.caption or "").strip()
+    if not text or text.startswith("/"):
+        return
+
+    is_private = chat.type == "private"
+    if not is_private:
+        if not REPLY_IN_GROUPS:
+            return
+        bot_username = (context.bot.username or "").lower()
+        mentioned = bool(bot_username) and f"@{bot_username}" in text.lower()
+        replied_to_bot = bool(
+            message.reply_to_message
+            and message.reply_to_message.from_user
+            and message.reply_to_message.from_user.id == context.bot.id
+        )
+        if not (mentioned or replied_to_bot):
+            return
+
+    if not await replies.should_reply(user.id):
+        return
+
+    try:
+        intent, reply_text = await replies.build_reply(
+            user.id,
+            text,
+            username=user.username,
+            first_name=user.first_name,
+        )
+    except Exception:
+        logger.exception("Contextual reply generation failed")
+        return
+
+    try:
+        await message.reply_text(reply_text, parse_mode="HTML", disable_web_page_preview=True)
+        logger.info("Contextual reply sent to %s (intent=%s)", user.id, intent)
+    except TelegramError as exc:
+        logger.warning("Contextual reply delivery failed: %s", exc)
+
+
+async def cmd_aistatus(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin view of the AI layer, memory sizes and zero-cost state."""
+    if not is_adm(update.effective_user.id):
+        return
+    stats = ai_stats()
+    crowd = await community.snapshot()
+    state = await market_memory.today()
+    lines = [
+        "<b>🤖 AI + MEMORY STATUS</b>",
+        "",
+        f"AI enabled: <code>{stats.get('ai_enabled')}</code>",
+        f"Configured provider: <code>{stats.get('configured_provider')}</code>",
+        f"Active provider: <code>{stats.get('active_provider')}</code> "
+        f"({'available' if stats.get('available') else 'unavailable'})",
+        f"Model: <code>{stats.get('model') or 'n/a'}</code>",
+        f"Zero-cost mode: <code>{stats.get('zero_cost_mode')}</code>",
+        f"Calls today: <code>{stats.get('calls_today')}</code> / <code>{AI_DAILY_CALL_BUDGET}</code>",
+        f"AI published: <code>{stats.get('published_ai')}</code> | "
+        f"Fallback: <code>{stats.get('published_fallback')}</code> | "
+        f"Guard rejects: <code>{stats.get('guard_rejected')}</code>",
+        "",
+        "<b>🧠 MEMORY</b>",
+        f"Market day: <code>{state.get('market_day')}</code>",
+        f"State: <code>{market_memory.describe(state)}</code>",
+        f"Community members: <code>{crowd.get('members', 0)}</code> | "
+        f"Voters today: <code>{crowd.get('voters_today', 0)}</code>",
+        f"Crowd choice: <code>{crowd.get('top_option') or 'n/a'}</code>",
+        "",
+        "<i>AI never decides direction, entry, SL, targets, RRR, OI or P&amp;L.</i>",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
 # ===================== WEBHOOK SERVER =====================
 webhook_runner: web.AppRunner | None = None
 
@@ -798,11 +993,27 @@ def get_all_handlers():
         CommandHandler("refer", cmd_refer),
         CommandHandler("addvip", cmd_addvip),
         CommandHandler("forcecall", cmd_force),
+        CommandHandler("aistatus", cmd_aistatus),
         CallbackQueryHandler(plan_cb, pattern=r"^plan_"),
         CallbackQueryHandler(back_cb, pattern=r"^back_plans$"),
         ChatJoinRequestHandler(join_req),
+        PollAnswerHandler(on_poll_answer),
         MessageHandler(filters.TEXT | filters.CAPTION, spam_guard, block=False),
     ]
+
+
+def get_handler_groups() -> list[tuple[Any, int]]:
+    """Handlers with explicit PTB groups.
+
+    Group 0 keeps the original behaviour (commands, callbacks, spam guard).
+    Contextual replies live in group 1 so they can run *in addition to* the
+    spam guard instead of competing with it inside the same group.
+    """
+    handlers: list[tuple[Any, int]] = [(handler, 0) for handler in get_all_handlers()]
+    handlers.append(
+        (MessageHandler(filters.TEXT & ~filters.COMMAND, contextual_reply, block=False), 1)
+    )
+    return handlers
 
 
 def get_scheduler_jobs() -> dict[str, Any]:

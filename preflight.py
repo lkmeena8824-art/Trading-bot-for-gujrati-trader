@@ -17,10 +17,12 @@ import logging
 import sys
 from pathlib import Path
 
-from config import AI_ENABLED, OPENAI_API_KEY, validate_config
+import config
+from config import validate_config
 from database import Database
 from engine import get_scheduler_jobs
 from market_data import market_data
+from message_ai import ai_available
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
 
@@ -42,10 +44,30 @@ async def run(network: bool) -> int:
         return 1
     print("PASS: Telegram/channel/admin configuration is present")
 
-    if AI_ENABLED and not OPENAI_API_KEY:
-        print("WARN: AI_ENABLED=true but OPENAI_API_KEY is missing; templates will be used")
+    active_provider = config.active_ai_provider()
+    if not config.AI_ENABLED:
+        print("PASS: zero-cost deterministic messaging is configured (AI_ENABLED=false)")
+    elif active_provider == "none":
+        print(
+            "WARN: AI_ENABLED=true but no usable provider key "
+            f"(AI_PROVIDER={config.AI_PROVIDER}); deterministic templates will be used"
+        )
     else:
-        print("PASS: zero-cost deterministic messaging is configured")
+        model = config.OPENAI_MODEL if active_provider == "openai" else config.GEMINI_MODEL
+        print(f"PASS: AI wording layer active via {active_provider} ({model}); key value not printed")
+        print(f"      daily call budget: {config.AI_DAILY_CALL_BUDGET}, min interval: {config.AI_MIN_INTERVAL_SECONDS}s")
+    print(f"PASS: AI can never decide direction/entry/SL/target/RRR/OI/P&L (guarded); live AI call possible: {ai_available()}")
+    print(
+        "PASS: contextual replies "
+        f"{'enabled' if config.REPLY_ENABLED else 'disabled'} "
+        f"(cooldown {config.REPLY_COOLDOWN_SECONDS}s, max {config.REPLY_MAX_PER_USER_PER_DAY}/user/day, "
+        f"groups: {config.REPLY_IN_GROUPS})"
+    )
+    print(
+        "PASS: memory "
+        f"community={config.COMMUNITY_MEMORY_ENABLED}, polls={config.POLL_TRACKING_ENABLED}, "
+        f"market history days={config.MARKET_MEMORY_DAYS}"
+    )
 
     expected_jobs = {
         "morning", "poll", "premarket", "open_pulse", "scanner", "no_trade",
@@ -62,6 +84,11 @@ async def run(network: bool) -> int:
         await database.connect()
         state = await database.get_daily_state()
         print(f"PASS: database migration/connectivity; market day {state['market_day']}")
+        # Phase 2 tables must exist for polls, community and market memory.
+        await database.get_market_memory()
+        await database.community_stats()
+        await database.ai_call_count()
+        print("PASS: Phase 2 memory tables (polls, poll_answers, community_memory, market_memory, ai_usage)")
     except Exception as exc:
         print(f"FAIL: database migration/connectivity: {exc}")
         return 1
