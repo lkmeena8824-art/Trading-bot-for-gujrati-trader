@@ -8,7 +8,7 @@ from telegram.ext import ApplicationBuilder
 
 from config import BOT_TOKEN, OI_UPDATE_INTERVAL_MINUTES, validate_config
 from database import db
-from engine import get_all_handlers, get_scheduler_jobs, scheduler, start_webhook, stop_webhook
+from engine import get_handler_groups, get_scheduler_jobs, scheduler, start_webhook, stop_webhook
 
 logging.basicConfig(
     format="%(asctime)s | %(name)-18s | %(levelname)-7s | %(message)s",
@@ -67,8 +67,8 @@ def main() -> None:
         .concurrent_updates(True)
         .build()
     )
-    for handler in get_all_handlers():
-        app.add_handler(handler)
+    for handler, group in get_handler_groups():
+        app.add_handler(handler, group=group)
 
     logger.info("Starting Elite Sniper Engine...")
     app.run_polling(drop_pending_updates=True)

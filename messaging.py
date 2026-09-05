@@ -4,7 +4,7 @@ import html
 from typing import Any
 
 from config import PAYMENT_DETAILS_TEXT, PLANS, RISK_DISCLAIMER
-from message_ai import optional_ai_message
+from message_ai import generate_message
 
 
 def _esc(value: Any) -> str:
@@ -237,5 +237,11 @@ def fmt_fomo(trade: dict, points: float) -> str:
     )
 
 
-async def ai_or_fallback(kind: str, facts: dict, fallback: str) -> str:
-    return await optional_ai_message(kind, facts, fallback)
+async def ai_or_fallback(kind: str, facts: dict, fallback: str, context: dict | None = None) -> str:
+    """Compatibility wrapper around the Phase 2 AI layer.
+
+    The deterministic template is always the fallback, so callers keep their
+    zero-cost behaviour when AI is disabled or when the fact guard rejects the
+    AI wording.
+    """
+    return await generate_message(kind, facts, fallback, context=context)
