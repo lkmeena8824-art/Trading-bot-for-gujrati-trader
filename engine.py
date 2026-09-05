@@ -1,376 +1,824 @@
-import os, logging, asyncio, random, re, time
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import hmac
+import json
+import logging
+import re
 from datetime import datetime
-from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup, ChatJoinRequest
-from telegram.ext import ContextTypes, CommandHandler, CallbackQueryHandler, MessageHandler, ChatJoinRequestHandler, filters
-from telegram.error import TelegramError
-import yfinance as yf
+from typing import Any
+
 from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
-from apscheduler.triggers.interval import IntervalTrigger
-from config import *
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
+from telegram.ext import (
+    CallbackQueryHandler,
+    ChatJoinRequestHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+from config import (
+    ADMIN_IDS,
+    AUTO_TRADE_CHANNEL,
+    ENABLE_BTST,
+    FREE_CHANNEL_ID,
+    MAX_DAILY_TRADES,
+    MARKET_CLOSE_TIME,
+    MARKET_OPEN_TIME,
+    PAYMENT_DETAILS_TEXT,
+    PAYMENT_TELEGRAM_LINK,
+    PAYMENT_WHATSAPP_LINK,
+    PLANS,
+    RISK_DISCLAIMER,
+    SIGNAL_SYMBOL,
+    VIP_CHANNEL_ID,
+    WEBHOOK_PORT,
+    WEBHOOK_SECRET,
+)
 from database import db
+from market_data import fetch_candles, get_real_candles, market_data
+from messaging import (
+    ai_or_fallback,
+    fmt_closing_summary,
+    fmt_fomo,
+    fmt_morning,
+    fmt_no_trade,
+    fmt_oi,
+    fmt_open_pulse,
+    fmt_pnl,
+    fmt_poll_intro,
+    fmt_premarket,
+    fmt_plan,
+    fmt_trade,
+    fmt_update,
+)
+from quality_control import (
+    is_market_day,
+    is_market_session_open,
+    is_trade_window,
+    market_day,
+    slot_for_time,
+)
+from signal_engine import build_signal
 
 logger = logging.getLogger(__name__)
 
-# Anti-spam cooldown for scanner (seconds)
-LAST_AUTO_POST_TIME = 0 
+# Compatibility variable retained, but the persistent DB slot reservation is
+# now the real anti-duplicate control.
+LAST_AUTO_POST_TIME = 0.0
 
-# ================= 1. MARKET DATA & SCANNER =================
-def get_morning_data():
-    try:
-        n = yf.Ticker("^NSEI").history(period="2d")
-        if len(n) >= 1:
-            c = round(n['Close'].iloc[-1], 1); p = round(n['Close'].iloc[-2], 1) if len(n)>=2 else c
-            nc = round(((c-p)/p)*100, 2)
-            d = yf.Ticker("^DJI").history(period="2d"); dc = round(d['Close'].iloc[-1], 1); dp = round(d['Close'].iloc[-2], 1); dc_ch = round(((dc-dp)/dp)*100, 2)
-            nq = yf.Ticker("^IXIC").history(period="2d"); nqc = round(nq['Close'].iloc[-1], 1); nqp = round(nq['Close'].iloc[-2], 1); nq_ch = round(((nqc-nqp)/nqp)*100, 2)
-            cr = yf.Ticker("CL=F").history(period="1d"); cr_c = round(cr['Close'].iloc[-1], 2) if len(cr)>0 else 78.5
-            return {"gift_nifty": c, "gift_nifty_change": nc, "dow_jones": dc, "dow_change": dc_ch, "nasdaq": nqc, "nasdaq_change": nq_ch, "crude_oil": cr_c, "usd_inr": 83.12, "r1": round(c+60,1), "r2": round(c+120,1), "s1": round(c-60,1), "s2": round(c-120,1)}
-    except Exception as e: logger.error(f"Morning data fail: {e}")
+
+def can_trade() -> bool:
+    """Compatibility wrapper: true only during one of the three trade slots."""
+    return is_trade_window()
+
+
+def is_adm(uid: int) -> bool:
+    return uid in ADMIN_IDS
+
+
+def _channel_id(channel_type: str) -> int:
+    return VIP_CHANNEL_ID if channel_type.upper() == "VIP" else FREE_CHANNEL_ID
+
+
+async def safe_send(bot, cid: int, text: str, rm=None) -> int | None:
+    """Send Telegram HTML safely with RetryAfter/network retries."""
+    if not cid:
+        logger.error("Telegram channel ID is missing")
+        return None
+    for attempt in range(3):
+        try:
+            message = await bot.send_message(
+                chat_id=cid,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=rm,
+                disable_web_page_preview=True,
+            )
+            return message.message_id
+        except RetryAfter as exc:
+            if attempt >= 2:
+                logger.error("Telegram flood limit exhausted: %s", exc)
+                return None
+            await asyncio.sleep(float(exc.retry_after))
+        except (TimedOut, NetworkError) as exc:
+            if attempt >= 2:
+                logger.error("Telegram network delivery failed: %s", exc)
+                return None
+            await asyncio.sleep(2**attempt)
+        except TelegramError as exc:
+            logger.error("Telegram delivery failed: %s", exc)
+            return None
     return None
 
-def get_real_candles(sym, count=20):
-    tickers = {"NIFTY": "^NSEI", "BANKNIFTY": "^NSEBANK", "SENSEX": "^BSESN"}
-    try:
-        data = yf.download(tickers.get(sym, "^NSEI"), period="5d", interval="5m", progress=False)
-        if len(data) >= count: return data.tail(count)
-    except: pass
-    return None
 
-def auto_scan_algo():
-    data = get_real_candles("NIFTY", 20)
-    if data is None or data.empty: return None
-    try:
-        closes = data['Close'].tolist()
-        ema9 = closes[-2]; ema21 = closes[-3] 
-        curr = closes[-1]; prev = closes[-2]
-        
-        if ema9 <= ema21 and curr > prev and (curr - ema21) > 10:
-            sl = round(data['Low'].tail(10).min(), 2)
-            risk = curr - sl
-            if risk <= 0: return None
-            return {"symbol": "NIFTY", "direction": "BUY", "entry": round(curr, 2), "sl": sl, "t1": round(curr+risk*1.5,2), "t2": round(curr+risk*3,2), "t3": round(curr+risk*5,2), "strategy": "AUTO_EMA"}
-        
-        if ema9 >= ema21 and curr < prev and (ema21 - curr) > 10:
-            sl = round(data['High'].tail(10).max(), 2)
-            risk = sl - curr
-            if risk <= 0: return None
-            return {"symbol": "NIFTY", "direction": "SELL", "entry": round(curr, 2), "sl": sl, "t1": round(curr-risk*1.5,2), "t2": round(curr-risk*3,2), "t3": round(curr-risk*5,2), "strategy": "AUTO_EMA"}
-    except: pass
-    return None
+async def post_call(
+    sym: str,
+    direction: str,
+    entry: float,
+    sl: float,
+    t1: float,
+    t2: float,
+    t3: float,
+    strategy: str,
+    channel_type: str,
+    bot,
+    *,
+    logic: str | None = None,
+    underlying: str | None = None,
+    option_type: str | None = None,
+    option_strike: float | None = None,
+    option_ltp: float | None = None,
+    slot: str | None = None,
+    source: str = "AUTO",
+    enforce_limit: bool = True,
+    entry_low: float | None = None,
+    entry_high: float | None = None,
+    risk_points: float | None = None,
+    rrr: float | None = None,
+) -> int | None:
+    """Create, deliver and activate one trade exactly once.
 
-# ================= 2. FORMATTERS =================
-def fmt_morning(d):
-    g, ge, gr = d["gift_nifty"], d["gift_nifty_change"], "🟢" if d["gift_nifty_change"]>=0 else "🔴"
-    return (f"<b>☀️ GOOD MORNING TRADERS!</b>\n\n"
-            f"<b>📊 NIFTY:</b> <code>{g:,.1f}</code> ({gr} <i>{ge:+.2f}%</i>)\n"
-            f"<b>🇺🇸 DOW:</b> <code>{d['dow_jones']:,.1f}</code> (<i>{d['dow_change']:+.2f}%</i>)\n"
-            f"<b>💻 NASDAQ:</b> <code>{d['nasdaq']:,.1f}</code>\n"
-            f"<b>🛢️ CRUDE:</b> <code>${d['crude_oil']:,.2f}</code>\n\n"
-            f"<b>━━━━━━━━━━━━━━━━━━━━━</b>\n"
-            f"<b>📐 NIFTY LEVELS</b>\n"
-            f"🔺 R1: <code>{d['r1']:,.1f}</code> | R2: <code>{d['r2']:,.1f}</code>\n"
-            f"🔻 S1: <code>{d['s1']:,.1f}</code> | S2: <code>{d['s2']:,.1f}</code>\n"
-            f"<b>━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-            f"📈 <b>Mood: {'🟢 BULLISH' if ge>=0 else '🔴 BEARISH'}</b>\n"
-            f"⏰ 8:45 AM pe Poll aayega.\n\n<i>{RISK_DISCLAIMER}</i>")
+    Normal automated calls are admitted atomically by the database. Manual
+    admin overrides remain available for backward compatibility and are clearly
+    labelled in the persisted source field.
+    """
+    direction = direction.upper()
+    channel_type = channel_type.upper()
+    risk_points = risk_points if risk_points is not None else abs(entry - sl)
+    rrr = rrr if rrr is not None else (abs(t3 - entry) / risk_points if risk_points else 0.0)
+    signal = {
+        "symbol": sym,
+        "underlying": underlying or sym,
+        "direction": direction,
+        "option_type": option_type,
+        "option_strike": option_strike,
+        "option_ltp": option_ltp,
+        "entry": entry,
+        "entry_low": entry_low if entry_low is not None else entry,
+        "entry_high": entry_high if entry_high is not None else entry,
+        "sl": sl,
+        "t1": t1,
+        "t2": t2,
+        "t3": t3,
+        "risk_points": risk_points,
+        "rrr": rrr,
+        "strategy": strategy,
+        "logic": logic or strategy,
+    }
+    if enforce_limit and not slot:
+        logger.info("Trade rejected: no active trade slot")
+        return None
 
-def fmt_trade(sym, dir, e, sl, t1, t2, t3, strat, status="ACTIVE"):
-    risk = abs(e - sl); rrr = abs(t2 - e) / risk if risk > 0 else 0
-    d = "🟢 BUY (LONG)" if dir=="BUY" else "🔴 SELL (SHORT)"
-    st = {"ACTIVE":"🟢 LIVE","T1_HIT":"✅ T1 DONE","T2_HIT":"🎯 T2 DONE","T3_HIT":"🏆 JACKPOT","SL_HIT":"❌ SL HIT"}.get(status, status)
-    return (f"<b>🚀 JACKPOT CALL — {sym}</b>\n\n"
-            f"<b>📍 TYPE:</b> {d}\n<b>🎯 ENTRY:</b> <code>{e:,.2f}</code>\n"
-            f"<b>🛡️ SL:</b> <code>{sl:,.2f}</code>\n"
-            f"<b>✅ T1:</b> <code>{t1:,.2f}</code> | <b>T2:</b> <code>{t2:,.2f}</code> | <b>T3:</b> <code>{t3:,.2f}</code>\n\n"
-            f"<b>⚡ STRATEGY:</b> <i>{strat}</i> | <b>📊 R:R:</b> <code>1:{rrr:.1f}</code>\n"
-            f"<b>📌 STATUS:</b> {st}\n\n<b>━━━━━━━━━━━━━━━━━━━━━</b>\n"
-            f"✅ T1 pe half book, SL cost pe trail.\n\n<i>{RISK_DISCLAIMER}</i>")
+    trade_id = await db.create_trade_if_allowed(
+        sym=sym,
+        direction=direction,
+        entry=entry,
+        sl=sl,
+        t1=t1,
+        t2=t2,
+        t3=t3,
+        strategy=strategy,
+        channel=channel_type,
+        market_day=market_day(),
+        slot=slot,
+        max_daily_trades=MAX_DAILY_TRADES,
+        underlying=underlying or sym,
+        option_type=option_type,
+        option_strike=option_strike,
+        option_ltp=option_ltp,
+        entry_low=signal["entry_low"],
+        entry_high=signal["entry_high"],
+        logic=signal["logic"],
+        source=source,
+        rrr=rrr,
+        risk_points=risk_points,
+        enforce_limit=enforce_limit,
+    )
+    if trade_id is None:
+        logger.info("Trade rejected by daily/slot quality gate: %s", sym)
+        return None
 
-def fmt_update(t, utype, nsl=None, pts=None):
-    s, d, e = t["symbol"], t["direction"], t["entry_price"]
-    p = f"<code>+{pts:,.1f}</code>" if pts and pts>=0 else f"<code>{pts:,.1f}</code>"
-    if utype=="T1_HIT": return f"<b>✅ T1 HIT! — {s}</b>\n\n📍 {d} @ <code>{e:,.2f}</code>\n💰 Points: {p}\n\n🔄 <b>Half book karo</b>\n🛡️ <b>SL TRAILED TO COST:</b> <code>{nsl:,.2f}</code>\n\n<i>{RISK_DISCLAIMER}</i>"
-    if utype=="T2_HIT": return f"<b>🎯 T2 HIT! — {s}</b>\n\n💰 Total Points: {p}\n\n<i>{RISK_DISCLAIMER}</i>"
-    if utype=="T3_HIT": return f"<b>🏆 T3 HIT! JACKPOT! — {s}</b>\n\n💰 <b>TOTAL POINTS: {p}</b>\n\n🔥🔥🔥 <b>SAALI MARKET KA RAJA BAN GAYE!</b> 🔥🔥🔥\n\n<i>{RISK_DISCLAIMER}</i>"
-    if utype=="SL_HIT": return f"<b>❌ SL HIT — {s}</b>\n\n💰 Points: {p}\n\n✅ <b>Discipline maintain karo!</b>\n\n<i>{RISK_DISCLAIMER}</i>"
+    message_id = await safe_send(bot, _channel_id(channel_type), fmt_trade(signal), None)
+    if message_id is None:
+        await db.update_trade(trade_id, status="DELIVERY_FAILED", last_event="DELIVERY_FAILED")
+        await db.record_trade_event(trade_id, "DELIVERY_FAILED", metadata="telegram_send_failed")
+        return None
 
-def fmt_fomo(t, pts):
-    return (f"<b>🔥 VIP JACKPOT RESULT 🔥</b>\n\n<b>📊 {t['symbol']}</b> | {t['strategy']}\n"
-            f"📍 Entry: <b>[HIDDEN FOR VIPs 🔒]</b>\n🛡️ SL: <b>[HIDDEN FOR VIPs 🔒]</b>\n\n"
-            f"<b>🏆 ACHIEVED! Points: +{pts:,.1f}</b>\n\n<i>Yeh call sirf VIP members ko milti hai.</i>\n\n<i>{RISK_DISCLAIMER}</i>")
+    await db.update_trade(trade_id, status="ACTIVE", message_id=message_id, last_event="POSTED")
+    await db.record_trade_event(trade_id, "POSTED", price=entry, metadata=source)
+    logger.info("SNIPER CALL %s posted as trade %s in slot %s", sym, trade_id, slot)
+    return trade_id
 
-def fmt_plan(pname):
-    p = PLANS.get(pname); disc = int((1 - p["price"]/p["original_price"])*100)
-    emoji = "👑" if pname=="Bronze" else "🥈" if pname=="Silver" else "🥇" if pname=="Gold" else "💎"
-    return (f"<b>━━━━━━━━━━━━━━━━━━━━━</b>\n{emoji} <b>SELECTED: {pname.upper()}</b>\n<b>━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-            f"<b>Duration:</b> <i>{p['duration_days']} Days</b>\n<b>Price:</b> <code>₹{p['price']:,}</code> <i>({disc}% OFF)</i>\n\n"
-            f"<b>━━━━━━━━━━━━━━━━━━━━━</b>\n{PAYMENT_DETAILS_TEXT}\n<b>━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-            f"<i>📌 Payment ke baad screenshot bhejna.</i>\n\n<i>{RISK_DISCLAIMER}</i>")
 
-# ================= 3. BROADCASTER & RISK =================
-async def safe_send(bot, cid, text, rm=None):
-    for i in range(3):
-        try: return (await bot.send_message(chat_id=cid, text=text, parse_mode="HTML", reply_markup=rm, disable_web_page_preview=True)).message_id
-        except TelegramError as e:
-            if "Flood" in str(e) and i<2: await asyncio.sleep(2**i) 
-            else: return None
+async def post_upd(tid: int, event: str, new_sl: float | None = None, points: float | None = None, bot=None) -> None:
+    trade = await db.get_trade(tid)
+    if not trade:
+        return
+    event = event.upper()
+    status_map = {
+        "BREAKEVEN": "BREAKEVEN",
+        "T2_HIT": "PARTIAL_BOOKED",
+        "T3_HIT": "T3_HIT",
+        "SL_HIT": "SL_HIT",
+    }
+    status = status_map.get(event, event)
+    fields: dict[str, Any] = {
+        "status": status,
+        "last_event": event,
+        "points_gained": points if points is not None else trade.get("points_gained", 0),
+        "realized_points": points if points is not None else trade.get("realized_points", 0),
+    }
+    if new_sl is not None:
+        fields["current_sl"] = new_sl
+    if event == "BREAKEVEN":
+        fields["breakeven_moved"] = 1
+    elif event == "T2_HIT":
+        fields["partial_booked"] = 1
+        fields["remaining_quantity"] = 0.5
+    elif event in {"T3_HIT", "SL_HIT"}:
+        fields["remaining_quantity"] = 0
+        fields["closed_at"] = datetime.utcnow().isoformat()
+        fields["exit_price"] = new_sl if event == "SL_HIT" else (trade.get("target3") or trade.get("entry_price"))
+    await db.update_trade(tid, **fields)
+    await db.record_trade_event(tid, event, price=new_sl, points=points)
 
-async def post_call(sym, dir, e, sl, t1, t2, t3, strat, ch, bot):
-    cid = VIP_CHANNEL_ID if ch=="VIP" else FREE_CHANNEL_ID
-    mid = await safe_send(bot, cid, fmt_trade(sym, dir, e, sl, t1, t2, t3, strat))
-    return await db.create_trade(sym, dir, e, sl, t1, t2, t3, strat, ch, mid)
+    if bot is not None:
+        await safe_send(
+            bot,
+            _channel_id(trade.get("channel_type", "FREE")),
+            fmt_update(trade, event, new_sl, points),
+        )
+        if event in {"T2_HIT", "T3_HIT"} and trade.get("channel_type") == "VIP":
+            keyboard = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🚀 JOIN VIP FOR QUALITY CALLS", url="https://t.me/+4oN8IsDUF1FhNjY1")]]
+            )
+            await safe_send(bot, FREE_CHANNEL_ID, fmt_fomo(trade, points or 0), rm=keyboard)
 
-async def post_upd(tid, utype, nsl=None, pts=None, bot=None):
-    t = await db.get_trade(tid)
-    if not t: return
-    await db.update_trade(tid, status=utype, current_sl=nsl if nsl else t["current_sl"], points_gained=pts if pts else 0)
-    cid = VIP_CHANNEL_ID if t["channel_type"]=="VIP" else FREE_CHANNEL_ID
-    await safe_send(bot, cid, fmt_update(t, utype, nsl, pts))
-    if utype in ("T2_HIT","T3_HIT") and t["channel_type"]=="VIP":
-        btn = InlineKeyboardMarkup([[InlineKeyboardButton("🚀 JOIN VIP FOR JACKPOT CALLS", url="https://t.me/+4oN8IsDUF1FhNjY1")]])
-        await safe_send(bot, FREE_CHANNEL_ID, fmt_fomo(t, pts), rm=btn)
 
-def can_trade():
-    now = datetime.now()
-    if now.weekday() >= 5 or now.strftime("%Y-%m-%d") in HOLIDAYS: return False
-    for sh,sm,eh,em in NO_TRADE_WINDOWS:
-        if now.replace(hour=sh,minute=sm,second=0) <= now <= now.replace(hour=eh,minute=em,second=0): return False
-    return any(now.replace(hour=sh,minute=sm,second=0) <= now <= now.replace(hour=eh,minute=em,second=0) for sh,sm,eh,em in ACTIVE_WINDOWS)
-
-# ================= 4. HANDLERS =================
-def is_adm(uid): return uid in ADMIN_IDS
-
-async def cmd_start(u, c):
-    ref_by = None
-    if c.args and c.args[0].startswith("ref_"):
-        try: ref_by = int(c.args[0].split("_")[1])
-        except: pass
-    await db.upsert_user(u.effective_user.id, u.effective_user.username, u.effective_user.first_name, ref_by)
-    await u.message.reply_text(f"<b>Hey {u.effective_user.first_name}! 👋</b>\n\nStrictly Quality Calls. Auto Algo Active.\n\n<b>🚀 VIP:</b> /plans | <b>🔗 Earn:</b> /refer\n\n<i>{RISK_DISCLAIMER}</i>", parse_mode="HTML")
-
-async def cmd_refer(u, c):
-    uid = u.effective_user.id
-    link = f"https://t.me/{(await u.bot.get_me()).username}?start=ref_{uid}"
-    await u.message.reply_text(f"<b>🔗 EARN VIA REFERRALS!</b>\n\n<code>{link}</code>\n\n<i>Share kar aur kamao!</i>", parse_mode="HTML")
-
-async def cmd_plans(u, c):
-    text = ("<b>🔥 EXCLUSIVE VIP ACCESS 🔥</b>\n\nMarket me log panic me hain, tu jackpot pick karna chahta hai?\n\n"
-            "<b>━━━━━━━━━━━━━━━━━━━━━</b>\n"
-            "👑 <b>BRONZE (30D)</b> ~~₹5,000~~ ➡️ <b>₹2,999</b>\n"
-            "🥈 <b>SILVER (90D)</b> ~~₹12,000~~ ➡️ <b>₹6,999</b>\n"
-            "🥇 <b>GOLD (6M)</b> ~~₹20,000~~ ➡️ <b>₹9,999</b>\n"
-            "💎 <b>DIAMOND (1Y)</b> ~~₹35,000~~ ➡️ <b>₹17,999</b>\n"
-            "<b>━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-            "<i>⚡ Strictly 1 Premium Call/Day. Quality > Quantity.</i>\n\n"
-            f"<i>{RISK_DISCLAIMER}</i>")
-    btns = [[InlineKeyboardButton(f"{'👑' if n=='Bronze' else '🥈' if n=='Silver' else '🥇' if n=='Gold' else '💎'} {n} — ₹{d['price']:,}", callback_data=f"plan_{n}")] for n,d in PLANS.items()]
-    await u.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
-
-async def plan_cb(u, c):
-    q = u.callback_query; await q.answer(); pn = q.data.replace("plan_","").capitalize()
-    if pn not in PLANS: return
-    btns = [[InlineKeyboardButton("📱 PAY VIA WHATSAPP", url=PAYMENT_WHATSAPP_LINK)], [InlineKeyboardButton("💬 PAY VIA TELEGRAM", url=PAYMENT_TELEGRAM_LINK)], [InlineKeyboardButton("◀️ BACK", callback_data="back_plans")]]
-    await q.edit_message_text(fmt_plan(pn), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
-
-async def back_cb(u, c):
-    q = u.callback_query; await q.answer()
-    fake = type('o',(object,),{'message':q.message,'effective_user':q.from_user})()
-    await cmd_plans(fake, c)
-
-async def cmd_addvip(u, c):
-    if not is_adm(u.effective_user.id): return
-    if len(c.args)<2: return await u.message.reply_text("<code>/addvip ID PLAN</code>", parse_mode="HTML")
-    try:
-        uid, pn = int(c.args[0]), c.args[1].capitalize()
-        if pn not in PLANS: return
-        await db.add_subscription(uid, pn)
-        await u.message.reply_text(f"✅ <b>VIP Granted!</b>", parse_mode="HTML")
-        try: await u.bot.send_message(chat_id=uid, text=f"<b>🎉 VIP ACTIVATED!</b>\nPlan: <b>{pn}</b>\n\n<a href='https://t.me/+4oN8IsDUF1FhNjY1'>JOIN VIP</a>", parse_mode="HTML", disable_web_page_preview=True)
-        except: pass
-    except Exception as e: await u.message.reply_text(f"❌ {e}")
-
-async def cmd_force(u, c):
-    if not is_adm(u.effective_user.id): return
-    if len(c.args)<7: return await u.message.reply_text("<code>/forcecall NIFTY BUY 22450 22410 22510 22570 22640 ORB VIP</code>", parse_mode="HTML")
-    try:
-        s,d = c.args[0].upper(), c.args[1].upper(); e,sl,t1,t2,t3 = float(c.args[2]),float(c.args[3]),float(c.args[4]),float(c.args[5]),float(c.args[6])
-        st = c.args[7] if len(c.args)>7 else "MANUAL"; ch = c.args[8].upper() if len(c.args)>8 else "VIP"
-        tid = await post_call(s,d,e,sl,t1,t2,t3,st,ch,u.bot)
-        await u.message.reply_text(f"✅ Posted! ID: {tid}")
-    except Exception as e: await u.message.reply_text(f"❌ {e}")
-
-async def join_req(u, c):
-    jr = u.chat_join_request; user = jr.from_user; cid = jr.chat.id
-    if cid != VIP_CHANNEL_ID: return
-    await db.upsert_user(user.id, user.username, user.first_name)
-    sub = await db.get_active_sub(user.id)
-    if sub:
-        try: await c.bot.approve_chat_join_request(cid, user.id); await c.bot.send_message(chat_id=user.id, text=f"<b>🚀 Welcome VIP!</b>", parse_mode="HTML")
-        except: pass
-    else:
-        try: await c.bot.decline_chat_join_request(cid, user.id); await c.bot.send_message(chat_id=user.id, text="<b>❌ VIP Required</b>\n/plans", parse_mode="HTML")
-        except: pass
-
-async def spam_guard(u, c):
-    if not u.message or not u.effective_chat or u.effective_chat.id != VIP_CHANNEL_ID: return
-    user = u.effective_user
-    if not user or user.id in ADMIN_IDS: return
-    txt = f"{u.message.text or ''} {u.message.caption or ''}"
-    if re.search(r"https?://(?!t\.me)|t\.me/joinchat/|whatsapp|free.*signals", txt, re.I):
-        try: await u.message.delete(); await db.ban_user(user.id, "Spam"); await c.bot.ban_chat_member(VIP_CHANNEL_ID, user.id)
-        except: pass
-
-# ================= 5. SCHEDULER JOBS (STRICT LIMITS) =================
+# ===================== SCHEDULER JOBS =====================
 scheduler = AsyncIOScheduler(timezone="Asia/Kolkata")
 
-async def job_morning(app):
-    data = get_morning_data()
-    if data: await safe_send(app.bot, FREE_CHANNEL_ID, fmt_morning(data))
 
-async def job_hype_poll(app):
-    hype = ("<b>⚡ MARKET KHULNE WALA HAI! SIR LAGAO DHAKKA! ⚡</b>\n\n"
-            "Smart money position li hai. Algo scanning live hai.\n"
-            "Agar 1:3+ ka setup milega toh immediate fire karenge!\n\n<b>👇 Neeche batayo, aaj kiski side me ho?</b>")
-    await safe_send(app.bot, FREE_CHANNEL_ID, hype)
-    try: await app.bot.send_poll(chat_id=FREE_CHANNEL_ID, question="🔥 AAJ KA MARKET MOOD?", options=["🟢 BULLISH", "🔴 BEARISH", "🟡 SIDEWAYS"], is_anonymous=False)
-    except: pass
+async def job_morning(app) -> None:
+    data = await market_data.morning_data()
+    fallback = fmt_morning(data)
+    text = await ai_or_fallback("morning_brief", data, fallback)
+    await safe_send(app.bot, FREE_CHANNEL_ID, text)
 
-async def job_auto_scanner(app):
-    global LAST_AUTO_POST_TIME
-    if not can_trade(): return
-    
-    # ANTI-SPAM: Agar last 15 min me post hua hai toh skip
-    if time.time() - LAST_AUTO_POST_TIME < 900: return 
 
-    total = await db.get_today_count()
-    if total >= MAX_DAILY_TRADES: return # Hard limit hit
-
-    # STRICT ALLOCATION LOGIC
-    free_count = await db.get_today_free_count()
-    vip_count = await db.get_today_vip_count()
-
-    ch = None
-    if free_count < MAX_DAILY_FREE_TRADES:
-        ch = "FREE"
-    elif vip_count < MAX_DAILY_VIP_TRADES:
-        ch = "VIP"
-    else:
-        return # Daily specific quota full. STOP SCANNING.
-
-    signal = auto_scan_algo()
-    if signal:
-        await post_call(signal["symbol"], signal["direction"], signal["entry"], signal["sl"], 
-                       signal["t1"], signal["t2"], signal["t3"], signal["strategy"], ch, app.bot)
-        LAST_AUTO_POST_TIME = time.time() # Update cooldown
-        logger.info(f"AUTO-TRADE: {signal['symbol']} -> {ch} (Free:{free_count}/{MAX_DAILY_FREE_TRADES}, VIP:{vip_count}/{MAX_DAILY_VIP_TRADES})")
-
-async def job_btst(app):
-    data = get_real_candles("NIFTY", 50)
-    if data is None or data.empty: return
+async def job_hype_poll(app) -> None:
+    await safe_send(app.bot, FREE_CHANNEL_ID, fmt_poll_intro())
     try:
-        c = round(data['Close'].iloc[-1], 2); l = round(data['Low'].min(), 2); sl = round(l - 20, 2)
-        await post_call("NIFTY", "BUY", c, sl, round(c+50,2), round(c+100,2), round(c+150,2), "BTST_EOD", "VIP", app.bot)
-    except: pass
+        await app.bot.send_poll(
+            chat_id=FREE_CHANNEL_ID,
+            question="🧠 AAJ KA SMART MONEY SENTIMENT?",
+            options=[
+                "🟢 Aggressive Long",
+                "🔴 Defensive Short",
+                "🟡 Sideways Trap",
+                "🛡️ No Trade",
+            ],
+            is_anonymous=False,
+        )
+    except TelegramError as exc:
+        logger.error("Poll failed: %s", exc)
 
-async def job_oi(app):
-    if not can_trade(): return
-    c, p = random.randint(8e6, 15e6), random.randint(7e6, 14e6); pcr = round(p/c, 3)
-    sent = "🟢 BULLISH" if pcr>1.2 else "🔴 BEARISH" if pcr<0.8 else "🟡 NEUTRAL"
-    txt = f"<b>📊 LIVE OI DATA</b>\n\n<b>PCR:</b> <code>{pcr:.3f}</code>\n<b>📈 Sentiment:</b> {sent}\n\n<i>{RISK_DISCLAIMER}</i>"
-    await safe_send(app.bot, FREE_CHANNEL_ID, txt); await safe_send(app.bot, VIP_CHANNEL_ID, txt)
 
-async def job_promo(app):
-    pt = "\n".join([f"{'💎' if n=='Diamond' else '🥇' if n=='Gold' else '🥈' if n=='Silver' else '🥉'} <b>{n}</b> ~~₹{d['original_price']:,}~~ ➡️ <b>₹{d['price']:,}</b>" for n,d in PLANS.items()])
-    await safe_send(app.bot, FREE_CHANNEL_ID, f"<b>🔥 SPECIAL OFFER 🔥</b>\n\n{pt}\n\n<i>{RISK_DISCLAIMER}</i>")
+async def job_premarket(app) -> None:
+    await safe_send(app.bot, FREE_CHANNEL_ID, fmt_premarket())
 
-async def job_summary(app):
+
+async def _spot_dict(symbol: str) -> dict:
+    candles = await fetch_candles(symbol, "5m", "5d", 5)
+    spot = candles[-1].close if candles else 0.0
+    return {"symbol": symbol, "spot": spot, "source": "FREE_YFINANCE"}
+
+
+async def job_open_pulse(app) -> None:
+    nifty, banknifty = await asyncio.gather(_spot_dict("NIFTY"), _spot_dict("BANKNIFTY"))
+    await safe_send(app.bot, FREE_CHANNEL_ID, fmt_open_pulse(nifty, banknifty))
+
+
+async def _select_channel() -> str:
+    # Keep existing Free/VIP behavior configurable while the global DB gate
+    # enforces the same maximum of three for every channel.
+    return "VIP" if AUTO_TRADE_CHANNEL == "VIP" else "FREE"
+
+
+async def job_auto_scanner(app) -> None:
+    slot = slot_for_time()
+    if not is_market_day() or not slot:
+        return
+    snapshot = await market_data.snapshot(SIGNAL_SYMBOL)
+    decision = build_signal(snapshot, slot)
+    if not decision.signal:
+        logger.info("No signal in %s: %s", slot, "; ".join(decision.reasons))
+        return
+    channel = await _select_channel()
+    signal = decision.signal
+    await post_call(
+        signal["symbol"],
+        signal["direction"],
+        signal["entry"],
+        signal["sl"],
+        signal["t1"],
+        signal["t2"],
+        signal["t3"],
+        signal["strategy"],
+        channel,
+        app.bot,
+        logic=signal["logic"],
+        underlying=signal["underlying"],
+        option_type=signal["option_type"],
+        option_strike=signal["option_strike"],
+        option_ltp=signal["option_ltp"],
+        slot=slot,
+        source="AUTO_SNIPER",
+        entry_low=signal["entry_low"],
+        entry_high=signal["entry_high"],
+        risk_points=signal["risk_points"],
+        rrr=signal["rrr"],
+    )
+
+
+async def job_no_trade_check(app) -> None:
+    if not is_market_day() or (await db.get_today_count()) > 0:
+        return
+    snapshot = await market_data.snapshot(SIGNAL_SYMBOL)
+    decision = build_signal(snapshot)
+    if decision.data_unavailable:
+        logger.info("No-trade checkpoint skipped because data is unavailable")
+        return
+    reason = decision.reasons[0] if decision.reasons else "no A+ setup confirmed"
+    if await db.mark_no_trade(state="NO_TRADE_ZONE" if decision.no_trade_zone else "NO_CONFIRMED_SETUP"):
+        await safe_send(app.bot, FREE_CHANNEL_ID, fmt_no_trade(reason))
+
+
+async def job_btst(app) -> None:
+    # Retained for compatibility, but never bypasses the new three-slot policy.
+    if not ENABLE_BTST:
+        return
+    logger.info("BTST is enabled but is disabled outside the configured sniper slots")
+
+
+async def job_oi(app) -> None:
+    if not is_market_session_open():
+        return
+    chain = await market_data.option_chain(SIGNAL_SYMBOL)
+    if not chain:
+        return
+    text = fmt_oi(
+        {
+            "symbol": chain.symbol,
+            "spot": chain.spot,
+            "expiry": chain.expiry,
+            "source": chain.source,
+        }
+    )
+    await safe_send(app.bot, FREE_CHANNEL_ID, text)
+    await safe_send(app.bot, VIP_CHANNEL_ID, text)
+
+
+async def job_closing(app) -> None:
+    nifty, banknifty = await asyncio.gather(
+        _spot_dict("NIFTY"),
+        _spot_dict("BANKNIFTY"),
+    )
     trades = await db.get_today_trades()
-    w = sum(1 for t in trades if t["status"] in ("T1_HIT","T2_HIT","T3_HIT")); l = sum(1 for t in trades if t["status"]=="SL_HIT")
-    pts = sum(t.get("points_gained",0) for t in trades); wr = (w/(w+l)*100) if (w+l)>0 else 0
-    txt = f"<b>📋 TODAY'S REPORT</b>\n\n<b>Trades:</b> <code>{len(trades)}</code> | <b>Win Rate:</b> <code>{wr:.0f}%</code> | <b>Points:</b> <code>{pts:+,.1f}</code>\n\n💪 <b>Consistency is key!</b>\n\n<i>{RISK_DISCLAIMER}</i>"
-    await safe_send(app.bot, FREE_CHANNEL_ID, txt)
-    if trades: await safe_send(app.bot, VIP_CHANNEL_ID, txt)
-    await db.update_stats(datetime.now().strftime("%Y-%m-%d"), total_trades=len(trades), winning_trades=w, losing_trades=l, total_points=pts)
+    text = fmt_closing_summary(nifty, banknifty, trades)
+    await safe_send(app.bot, FREE_CHANNEL_ID, text)
+    if trades:
+        await safe_send(app.bot, VIP_CHANNEL_ID, text)
 
-async def job_expiry(app):
-    for sub in await db.get_expired_subs():
-        await db.deactivate_sub(sub["id"])
-        try: await app.bot.ban_chat_member(VIP_CHANNEL_ID, sub["user_id"]); await app.bot.unban_chat_member(VIP_CHANNEL_ID, sub["user_id"])
-        except: pass
 
-async def job_monitor(app):
-    if not can_trade(): return
-    for t in await db.get_active_trades():
-        data = get_real_candles(t["symbol"], 5)
-        if data is None or data.empty: continue
+async def job_pnl(app) -> None:
+    trades = await db.get_today_trades()
+    text = fmt_pnl(trades)
+    await safe_send(app.bot, FREE_CHANNEL_ID, text)
+    if trades:
+        await safe_send(app.bot, VIP_CHANNEL_ID, text)
+
+    winners = sum(
+        1 for trade in trades
+        if trade.get("status") in {"T3_HIT", "CLOSED_TARGET"}
+    )
+    losers = sum(1 for trade in trades if trade.get("status") in {"SL_HIT", "CLOSED_STOP"})
+    total_points = sum(float(trade.get("realized_points") or trade.get("points_gained") or 0) for trade in trades)
+    await db.update_stats(
+        market_day(),
+        total_trades=len(trades),
+        winning_trades=winners,
+        losing_trades=losers,
+        total_points=total_points,
+        net_pnl=total_points,
+    )
+
+
+async def job_promo(app) -> None:
+    prices = "\n".join(
+        f"{'💎' if name == 'Diamond' else '🥇' if name == 'Gold' else '🥈' if name == 'Silver' else '🥉'} "
+        f"<b>{name}</b> ~~₹{data['original_price']:,}~~ ➡️ <b>₹{data['price']:,}</b>"
+        for name, data in PLANS.items()
+    )
+    await safe_send(app.bot, FREE_CHANNEL_ID, f"<b>🔥 SPECIAL OFFER 🔥</b>\n\n{prices}\n\n<i>{RISK_DISCLAIMER}</i>")
+
+
+async def job_expiry(app) -> None:
+    for subscription in await db.get_expired_subs():
+        await db.deactivate_sub(subscription["id"])
         try:
-            cp = round(data['Close'].iloc[-1], 2); sl = t["current_sl"] or t["sl"]
-            if t["direction"]=="BUY":
-                if cp <= sl: await post_upd(t["id"], "SL_HIT", pts=sl-t["entry_price"], bot=app.bot)
-                elif cp >= t["target1"] and t["status"]=="ACTIVE": await post_upd(t["id"], "T1_HIT", nsl=t["entry_price"], pts=t["target1"]-t["entry_price"], bot=app.bot)
-                elif cp >= t["target2"] and t["status"]=="T1_HIT": await post_upd(t["id"], "T2_HIT", nsl=t["target1"], pts=t["target2"]-t["entry_price"], bot=app.bot)
-                elif cp >= t["target3"]: await post_upd(t["id"], "T3_HIT", pts=t["target3"]-t["entry_price"], bot=app.bot)
-            else:
-                if cp >= sl: await post_upd(t["id"], "SL_HIT", pts=t["entry_price"]-sl, bot=app.bot)
-                elif cp <= t["target1"] and t["status"]=="ACTIVE": await post_upd(t["id"], "T1_HIT", nsl=t["entry_price"], pts=t["entry_price"]-t["target1"], bot=app.bot)
-                elif cp <= t["target2"] and t["status"]=="T1_HIT": await post_upd(t["id"], "T2_HIT", nsl=t["target1"], pts=t["entry_price"]-t["target2"], bot=app.bot)
-                elif cp <= t["target3"]: await post_upd(t["id"], "T3_HIT", pts=t["entry_price"]-t["target3"], bot=app.bot)
-        except Exception as e: logger.error(f"Monitor err: {e}")
+            await app.bot.ban_chat_member(VIP_CHANNEL_ID, subscription["user_id"])
+            await app.bot.unban_chat_member(VIP_CHANNEL_ID, subscription["user_id"])
+        except TelegramError:
+            logger.info("Could not remove expired user %s", subscription["user_id"])
 
-# ================= 6. WEBHOOK SERVER =================
-async def start_webhook(app):
-    wa = web.Application(); wa["telegram_app"] = app
-    async def tv_handler(request):
+
+def _signed_points(trade: dict, price: float, quantity: float = 1.0) -> float:
+    entry = float(trade.get("entry_price") or 0)
+    if trade.get("direction") == "BUY":
+        return (price - entry) * quantity
+    return (entry - price) * quantity
+
+
+async def _manage_trade(trade: dict, candles: list, bot) -> None:
+    if not candles:
+        return
+    current = candles[-1].close
+    direction = trade.get("direction")
+    entry = float(trade.get("entry_price") or 0)
+    initial_risk = float(trade.get("risk_points") or abs(entry - float(trade.get("sl") or entry)))
+    if entry <= 0 or initial_risk <= 0:
+        return
+    current_sl = float(trade.get("current_sl") or trade.get("sl") or entry)
+    status = trade.get("status")
+
+    if direction == "BUY":
+        stop_hit = current <= current_sl
+        reached_1r = current >= entry + initial_risk
+        reached_2r = current >= float(trade.get("target2") or entry + initial_risk * 2)
+        reached_3r = current >= float(trade.get("target3") or entry + initial_risk * 3)
+    else:
+        stop_hit = current >= current_sl
+        reached_1r = current <= entry - initial_risk
+        reached_2r = current <= float(trade.get("target2") or entry - initial_risk * 2)
+        reached_3r = current <= float(trade.get("target3") or entry - initial_risk * 3)
+
+    # A stop is checked first to avoid reporting a target on an adverse close.
+    if status in {"ACTIVE", "BREAKEVEN"} and stop_hit:
+        await post_upd(trade["id"], "SL_HIT", new_sl=current_sl, points=_signed_points(trade, current), bot=bot)
+        return
+
+    if status == "ACTIVE" and reached_1r:
+        await post_upd(trade["id"], "BREAKEVEN", new_sl=entry, points=0.0, bot=bot)
+        return
+
+    if status == "BREAKEVEN":
+        if reached_2r:
+            partial = _signed_points(trade, float(trade.get("target2") or current), 0.5)
+            await post_upd(trade["id"], "T2_HIT", new_sl=entry, points=partial, bot=bot)
+            return
+        if stop_hit:
+            await post_upd(trade["id"], "SL_HIT", new_sl=current_sl, points=0.0, bot=bot)
+            return
+
+    if status == "PARTIAL_BOOKED":
+        partial = _signed_points(trade, float(trade.get("target2") or entry), 0.5)
+        if reached_3r:
+            final = partial + _signed_points(trade, float(trade.get("target3") or current), 0.5)
+            await post_upd(trade["id"], "T3_HIT", new_sl=float(trade.get("target3") or current), points=final, bot=bot)
+            return
+        if stop_hit:
+            runner = _signed_points(trade, current, 0.5)
+            await post_upd(trade["id"], "SL_HIT", new_sl=current_sl, points=partial + runner, bot=bot)
+            return
+
+        # ATR-like trailing approximation from recent candle range. The stop
+        # can only tighten, never loosen.
+        recent = candles[-14:]
+        average_range = sum(c.high - c.low for c in recent) / len(recent) if recent else initial_risk
+        trail_distance = max(average_range * 1.2, initial_risk * 0.25)
+        candidate = current - trail_distance if direction == "BUY" else current + trail_distance
+        tightened = max(current_sl, candidate) if direction == "BUY" else min(current_sl, candidate)
+        if abs(tightened - current_sl) >= max(0.01, initial_risk * 0.05):
+            await db.update_trade(trade["id"], current_sl=round(tightened, 2), last_event="TRAIL_UPDATED")
+            await db.record_trade_event(trade["id"], "TRAIL_UPDATED", price=tightened)
+
+
+async def job_monitor(app) -> None:
+    if not is_market_session_open():
+        return
+    for trade in await db.get_active_trades():
+        try:
+            underlying = trade.get("underlying") or trade.get("symbol") or SIGNAL_SYMBOL
+            candles = await fetch_candles(underlying, "5m", "5d", 30)
+            await _manage_trade(trade, candles, app.bot)
+        except Exception as exc:
+            logger.exception("Trade monitor error for %s: %s", trade.get("id"), exc)
+
+
+# ===================== TELEGRAM HANDLERS =====================
+async def cmd_start(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    ref_by = None
+    if context.args and context.args[0].startswith("ref_"):
+        try:
+            ref_by = int(context.args[0].split("_", 1)[1])
+        except ValueError:
+            ref_by = None
+    await db.upsert_user(user.id, user.username, user.first_name, ref_by)
+    await update.message.reply_text(
+        f"<b>Hey {user.first_name}! 👋</b>\n\n"
+        "Elite Sniper mode active. A+ setups only.\n\n"
+        "<b>🚀 VIP:</b> /plans | <b>🔗 Earn:</b> /refer\n\n"
+        f"<i>{RISK_DISCLAIMER}</i>",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_refer(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    bot_user = await update.bot.get_me()
+    link = f"https://t.me/{bot_user.username}?start=ref_{uid}"
+    await update.message.reply_text(
+        f"<b>🔗 EARN VIA REFERRALS!</b>\n\n<code>{link}</code>\n\n<i>Share kar aur kamao!</i>",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_plans(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (
+        "<b>🔥 EXCLUSIVE VIP ACCESS 🔥</b>\n\n"
+        "Quality alerts, transparent updates and disciplined risk management.\n\n"
+        "<b>━━━━━━━━━━━━━━━━━━━━━</b>\n"
+        "👑 <b>BRONZE (30D)</b> ~~₹5,000~~ ➡️ <b>₹2,999</b>\n"
+        "🥈 <b>SILVER (90D)</b> ~~₹12,000~~ ➡️ <b>₹6,999</b>\n"
+        "🥇 <b>GOLD (6M)</b> ~~₹20,000~~ ➡️ <b>₹9,999</b>\n"
+        "💎 <b>DIAMOND (1Y)</b> ~~₹35,000~~ ➡️ <b>₹17,999</b>\n"
+        "<b>━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+        "<i>⚡ Maximum three quality trade decisions per day; no forced calls.</i>\n\n"
+        f"<i>{RISK_DISCLAIMER}</i>"
+    )
+    buttons = [
+        [InlineKeyboardButton(f"{('👑' if name == 'Bronze' else '🥈' if name == 'Silver' else '🥇' if name == 'Gold' else '💎')} {name} — ₹{data['price']:,}", callback_data=f"plan_{name}")]
+        for name, data in PLANS.items()
+    ]
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def plan_cb(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    plan_name = query.data.replace("plan_", "").capitalize()
+    if plan_name not in PLANS:
+        return
+    buttons = [
+        [InlineKeyboardButton("📱 PAY VIA WHATSAPP", url=PAYMENT_WHATSAPP_LINK)],
+        [InlineKeyboardButton("💬 PAY VIA TELEGRAM", url=PAYMENT_TELEGRAM_LINK)],
+        [InlineKeyboardButton("◀️ BACK", callback_data="back_plans")],
+    ]
+    await query.edit_message_text(
+        fmt_plan(plan_name),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def back_cb(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    fake_update = type("FakeUpdate", (), {"message": query.message, "effective_user": query.from_user})()
+    await cmd_plans(fake_update, context)
+
+
+async def cmd_addvip(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_adm(update.effective_user.id):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("<code>/addvip ID PLAN</code>", parse_mode="HTML")
+        return
+    try:
+        user_id, plan_name = int(context.args[0]), context.args[1].capitalize()
+        if plan_name not in PLANS:
+            return
+        await db.add_subscription(user_id, plan_name)
+        await update.message.reply_text("✅ <b>VIP Granted!</b>", parse_mode="HTML")
+        try:
+            await update.bot.send_message(
+                chat_id=user_id,
+                text=f"<b>🎉 VIP ACTIVATED!</b>\nPlan: <b>{plan_name}</b>\n\n<a href='https://t.me/+4oN8IsDUF1FhNjY1'>JOIN VIP</a>",
+                parse_mode="HTML",
+            )
+        except TelegramError:
+            pass
+    except (TypeError, ValueError, KeyError) as exc:
+        await update.message.reply_text(f"❌ {exc}")
+
+
+async def cmd_force(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_adm(update.effective_user.id):
+        return
+    if len(context.args) < 7:
+        await update.message.reply_text(
+            "<code>/forcecall NIFTY BUY 22450 22410 22500 22600 22750 ORB VIP</code>",
+            parse_mode="HTML",
+        )
+        return
+    try:
+        symbol = context.args[0].upper()
+        direction = context.args[1].upper()
+        entry, sl, t1, t2, t3 = (float(value) for value in context.args[2:7])
+        strategy = context.args[7] if len(context.args) > 7 else "MANUAL"
+        channel = context.args[8].upper() if len(context.args) > 8 else "VIP"
+        trade_id = await post_call(
+            symbol,
+            direction,
+            entry,
+            sl,
+            t1,
+            t2,
+            t3,
+            strategy,
+            channel,
+            update.bot,
+            source="MANUAL_OVERRIDE",
+            slot=slot_for_time(),
+            enforce_limit=True,
+            logic="Admin manual override; still subject to the three-trade and slot policy.",
+        )
+        await update.message.reply_text(
+            f"{'✅ Posted! ID: ' + str(trade_id) if trade_id else '⛔ Rejected by the three-trade/slot quality policy.'}"
+        )
+    except (TypeError, ValueError) as exc:
+        await update.message.reply_text(f"❌ {exc}")
+
+
+async def join_req(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    request = update.chat_join_request
+    user = request.from_user
+    if request.chat.id != VIP_CHANNEL_ID:
+        return
+    await db.upsert_user(user.id, user.username, user.first_name)
+    subscription = await db.get_active_sub(user.id)
+    if subscription:
+        try:
+            await context.bot.approve_chat_join_request(request.chat.id, user.id)
+            await context.bot.send_message(chat_id=user.id, text="<b>🚀 Welcome VIP!</b>", parse_mode="HTML")
+        except TelegramError:
+            pass
+    else:
+        try:
+            await context.bot.decline_chat_join_request(request.chat.id, user.id)
+            await context.bot.send_message(chat_id=user.id, text="<b>❌ VIP Required</b>\n/plans", parse_mode="HTML")
+        except TelegramError:
+            pass
+
+
+async def spam_guard(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat or update.effective_chat.id != VIP_CHANNEL_ID:
+        return
+    user = update.effective_user
+    if not user or user.id in ADMIN_IDS:
+        return
+    text = f"{update.message.text or ''} {update.message.caption or ''}"
+    if re.search(r"https?://(?!t\\.me)|t\\.me/joinchat/|whatsapp|free.*signals", text, re.I):
+        try:
+            await update.message.delete()
+            await db.ban_user(user.id, "Spam")
+            await context.bot.ban_chat_member(VIP_CHANNEL_ID, user.id)
+        except TelegramError:
+            pass
+
+
+# ===================== WEBHOOK SERVER =====================
+webhook_runner: web.AppRunner | None = None
+
+
+def _authorized(request: web.Request) -> bool:
+    if not WEBHOOK_SECRET:
+        return True  # backward compatibility; configure secret in production
+    supplied = request.headers.get("X-Webhook-Secret", "")
+    return hmac.compare_digest(supplied, WEBHOOK_SECRET)
+
+
+async def start_webhook(app) -> None:
+    global webhook_runner
+    web_app = web.Application()
+    web_app["telegram_app"] = app
+
+    async def tv_handler(request: web.Request) -> web.Response:
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
         try:
             body = await request.json()
-            if not can_trade(): return web.json_response({"status": "risk_blocked"})
-            sym = body.get("ticker","NIFTY").split(":")[-1].replace("FUT","").strip().upper()
-            d = "BUY" if body.get("action","").lower() in ("buy","long") else "SELL" if body.get("action","").lower() in ("sell","short") else None
-            if not d or float(body.get("price",0))<=0: return web.json_response({"status": "invalid"})
-            
-            # Apply strict limits to webhooks too
-            total = await db.get_today_count()
-            if total >= MAX_DAILY_TRADES: return web.json_response({"status": "daily_limit_reached"})
-            
-            free_count = await db.get_today_free_count()
-            vip_count = await db.get_today_vip_count()
-            ch = "FREE" if free_count < MAX_DAILY_FREE_TRADES else "VIP" if vip_count < MAX_DAILY_VIP_TRADES else None
-            if not ch: return web.json_response({"status": "quota_full"})
-            
-            p = float(body.get("price",0)); rp = p*0.003
-            sl = round(p-rp,2) if d=="BUY" else round(p+rp,2)
-            t1 = round(p+rp,2) if d=="BUY" else round(p-rp,2)
-            t2 = round(p+rp*2,2) if d=="BUY" else round(p-rp*2,2)
-            t3 = round(p+rp*3,2) if d=="BUY" else round(p-rp*3,2)
-            tid = await post_call(sym, d, p, sl, t1, t2, t3, "WEBHOOK", ch, app.bot)
-            return web.json_response({"status": "posted", "id": tid, "channel": ch})
-        except Exception as e: return web.json_response({"error": str(e)}, status=500)
+            symbol = body.get("ticker", SIGNAL_SYMBOL).split(":")[-1].replace("FUT", "").strip().upper()
+            if symbol not in {"NIFTY", "BANKNIFTY", "SENSEX"}:
+                symbol = SIGNAL_SYMBOL
+            requested = str(body.get("action", "")).lower()
+            requested_direction = "BUY" if requested in {"buy", "long"} else "SELL" if requested in {"sell", "short"} else None
+            if not requested_direction or not is_trade_window():
+                return web.json_response({"status": "rejected_quality_or_window"})
 
-    async def pay_handler(request):
+            snapshot = await market_data.snapshot(symbol)
+            decision = build_signal(snapshot, slot_for_time())
+            signal = decision.signal
+            if not signal or signal["direction"] != requested_direction:
+                return web.json_response({"status": "rejected_multi_confirmation", "reasons": decision.reasons})
+            trade_id = await post_call(
+                signal["symbol"], signal["direction"], signal["entry"], signal["sl"],
+                signal["t1"], signal["t2"], signal["t3"], signal["strategy"],
+                await _select_channel(), app.bot, logic=signal["logic"], underlying=signal["underlying"],
+                option_type=signal["option_type"], option_strike=signal["option_strike"], option_ltp=signal["option_ltp"],
+                slot=slot_for_time(), source="TRADINGVIEW_CONFIRMED",
+                entry_low=signal["entry_low"], entry_high=signal["entry_high"],
+                risk_points=signal["risk_points"], rrr=signal["rrr"],
+            )
+            if not trade_id:
+                return web.json_response({"status": "daily_limit_or_slot_used"})
+            return web.json_response({"status": "posted", "id": trade_id})
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except Exception as exc:
+            logger.exception("TradingView webhook failure")
+            return web.json_response({"error": "internal webhook failure"}, status=500)
+
+    async def pay_handler(request: web.Request) -> web.Response:
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
         try:
-            body = await request.json(); uid = int(body.get("user_id", 0)); plan = body.get("plan", "").capitalize()
-            if not uid or plan not in PLANS: return web.json_response({"error": "Invalid"})
-            await db.add_subscription(uid, plan)
-            try: await app.bot.send_message(chat_id=uid, text=f"<b>🎉 VIP ACTIVATED!</b>\nPlan: <b>{plan}</b>\n\n<a href='https://t.me/+4oN8IsDUF1FhNjY1'>JOIN VIP</a>", parse_mode="HTML", disable_web_page_preview=True)
-            except: pass
+            body = await request.json()
+            user_id = int(body.get("user_id", 0))
+            plan = str(body.get("plan", "")).capitalize()
+            if not user_id or plan not in PLANS:
+                return web.json_response({"error": "invalid"}, status=400)
+            await db.add_subscription(user_id, plan)
+            try:
+                await app.bot.send_message(
+                    chat_id=user_id,
+                    text=f"<b>🎉 VIP ACTIVATED!</b>\nPlan: <b>{plan}</b>\n\n<a href='https://t.me/+4oN8IsDUF1FhNjY1'>JOIN VIP</a>",
+                    parse_mode="HTML",
+                )
+            except TelegramError:
+                pass
             return web.json_response({"status": "activated"})
-        except Exception as e: return web.json_response({"error": str(e)}, status=500)
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except Exception:
+            logger.exception("Payment webhook failure")
+            return web.json_response({"error": "internal webhook failure"}, status=500)
 
-    wa.router.add_post("/webhook/tradingview", tv_handler)
-    wa.router.add_post("/webhook/payment", pay_handler)
-    wa.router.add_get("/health", lambda r: web.json_response({"status": "healthy"}))
-    runner = web.AppRunner(wa); await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT).start()
+    async def health_handler(request: web.Request) -> web.Response:
+        return web.json_response({"status": "healthy", "quality_mode": "multi_confirmation"})
+
+    web_app.router.add_post("/webhook/tradingview", tv_handler)
+    web_app.router.add_post("/webhook/payment", pay_handler)
+    web_app.router.add_get("/health", health_handler)
+    webhook_runner = web.AppRunner(web_app)
+    await webhook_runner.setup()
+    await web.TCPSite(webhook_runner, "0.0.0.0", WEBHOOK_PORT).start()
+    logger.info("Webhook server listening on 0.0.0.0:%s", WEBHOOK_PORT)
+
+
+async def stop_webhook() -> None:
+    global webhook_runner
+    if webhook_runner:
+        await webhook_runner.cleanup()
+        webhook_runner = None
+
 
 def get_all_handlers():
     return [
-        CommandHandler("start", cmd_start), CommandHandler("plans", cmd_plans), CommandHandler("refer", cmd_refer),
-        CommandHandler("addvip", cmd_addvip), CommandHandler("forcecall", cmd_force),
-        CallbackQueryHandler(plan_cb, pattern=r"^plan_"), CallbackQueryHandler(back_cb, pattern=r"^back_plans$"),
+        CommandHandler("start", cmd_start),
+        CommandHandler("plans", cmd_plans),
+        CommandHandler("refer", cmd_refer),
+        CommandHandler("addvip", cmd_addvip),
+        CommandHandler("forcecall", cmd_force),
+        CallbackQueryHandler(plan_cb, pattern=r"^plan_"),
+        CallbackQueryHandler(back_cb, pattern=r"^back_plans$"),
         ChatJoinRequestHandler(join_req),
-        MessageHandler(filters.TEXT | filters.CAPTION, spam_guard, block=False)
+        MessageHandler(filters.TEXT | filters.CAPTION, spam_guard, block=False),
     ]
 
-def get_scheduler_jobs(): return [job_morning, job_hype_poll, job_auto_scanner, job_btst, job_oi, job_promo, job_summary, job_expiry, job_monitor]
+
+def get_scheduler_jobs() -> dict[str, Any]:
+    """Named scheduler registry avoids the original positional-index bug."""
+    return {
+        "morning": job_morning,
+        "poll": job_hype_poll,
+        "premarket": job_premarket,
+        "open_pulse": job_open_pulse,
+        "scanner": job_auto_scanner,
+        "no_trade": job_no_trade_check,
+        "btst": job_btst,
+        "oi": job_oi,
+        "closing": job_closing,
+        "pnl": job_pnl,
+        "promo": job_promo,
+        "expiry": job_expiry,
+        "monitor": job_monitor,
+    }
